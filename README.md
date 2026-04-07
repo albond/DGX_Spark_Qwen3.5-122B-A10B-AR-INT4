@@ -113,7 +113,7 @@ docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
 docker run -d --name vllm-qwen35 \
   --gpus all --net=host --ipc=host \
   -v ~/models:/models \
-  vllm-qwen35-v019-v2 \
+  vllm-qwen35-v2 \
   serve /models/qwen35-122b-hybrid-int4fp8 \
   --served-model-name qwen \
   --port 8000 \
@@ -196,7 +196,7 @@ DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built ima
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-docker build -t vllm-qwen35-v019 .
+docker build -t vllm-sm121 .
 ```
 
 If building manually, the critical environment variables are:
@@ -419,9 +419,8 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 | Previous best (v1, MTP-1 + Hybrid) | 38.4 | -25% |
 | Intel AutoRound INT4 (vLLM, FlashInfer) | 28.3 | -45% |
 | llama.cpp GGUF Q5_K | 23.0 | -55% |
-| Ollama Q4_K_M | 18.9 | -63% |
 | NVFP4 RedHatAI (vLLM) | 16.6 | -67% |
-| Official Qwen GPTQ-Int4 (vLLM) | 14.0 | -73% |
+| Official Qwen GPTQ-Int4 (vLLM) | 15.0 | -71% |
 
 ---
 
