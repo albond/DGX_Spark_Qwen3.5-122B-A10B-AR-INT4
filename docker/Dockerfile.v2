@@ -1,0 +1,42 @@
+# DGX Spark Qwen3.5-122B v2
+#
+# All-in-one: vLLM 0.19 + Hybrid INT4+FP8 + INT8 LM Head v2
+# Result: 51 tok/s on DGX Spark with MTP-2 (+80% vs baseline)
+#
+# Tested with: vLLM 0.19.1
+# WARNING: Patches are version-specific. Newer vLLM may need re-qualification.
+#
+# Prerequisites:
+#   - A vLLM 0.19.x Docker image compiled for SM121 (TORCH_CUDA_ARCH_LIST=12.1a)
+#   - Replace the FROM line below with your vLLM base image name
+#
+# Build:
+#   docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
+#
+# Run (256K context, 51 tok/s):
+#   docker run --gpus all --net=host -v ~/models:/models \
+#     vllm-qwen35-v2 \
+#     serve /models/qwen35-122b-hybrid-int4fp8 \
+#     --served-model-name qwen --port 8000 \
+#     --max-model-len 262144 --gpu-memory-utilization 0.90 \
+#     --reasoning-parser qwen3 --attention-backend FLASHINFER \
+#     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# Base: vLLM 0.19.1 compiled for SM121 (built in Step 3 of README)
+# Tested build: 0.19.1.dev0+g2a69949bd (commit 2a69949bd, 2026-04-04)
+# WARNING: Do NOT use other vLLM versions without re-testing patches.
+FROM vllm-sm121:latest
+
+# Patch 1: Hybrid INT4+FP8 dispatch for shared expert dense layers
+COPY patches/01-hybrid-int4-fp8/inc.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/inc.py
+
+# Patch 2: INT8 LM Head v2 (applied at runtime by entrypoint)
+COPY patches/03-int8-lm-head/patch_int8_lmhead.py /opt/patches/patch_int8_lmhead.py
+
+# Entrypoint applies runtime patches, then starts vLLM
+COPY docker/entrypoint-v2.sh /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh
+
+ENTRYPOINT ["/opt/entrypoint.sh"]
+CMD ["serve", "--help"]

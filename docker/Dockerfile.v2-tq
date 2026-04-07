@@ -1,0 +1,50 @@
+# DGX Spark Qwen3.5-122B v2-tq: v2 + TurboQuant KV Cache (optional)
+#
+# All-in-one: vLLM 0.19 + Hybrid INT4+FP8 + INT8 LM Head v2 + TurboQuant
+# Result: 39 tok/s (-22% vs v2), but 4x more KV cache (1.4M tokens)
+#
+# Tested with: vLLM 0.19.1 + mitkox/vllm-turboquant
+# WARNING: Patches are version-specific.
+#
+# Build:
+#   docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
+#
+# Run (256K context with TQ, 39 tok/s, 1.4M token cache):
+#   docker run --gpus all --net=host -v ~/models:/models \
+#     vllm-qwen35-v2-tq \
+#     serve /models/qwen35-122b-hybrid-int4fp8 \
+#     --served-model-name qwen --port 8000 \
+#     --max-model-len 262144 --gpu-memory-utilization 0.90 \
+#     --reasoning-parser qwen3 \
+#     --kv-cache-dtype turboquant35 --enable-turboquant \
+#     --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+#     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# Base: vLLM 0.19.1 compiled for SM121 (built in Step 3 of README)
+# Tested build: 0.19.1.dev0+g2a69949bd (commit 2a69949bd, 2026-04-04)
+# WARNING: Do NOT use other vLLM versions without re-testing patches.
+FROM vllm-sm121:latest
+
+# Patch 1: Hybrid INT4+FP8 dispatch
+COPY patches/01-hybrid-int4-fp8/inc.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/inc.py
+
+# Patch 2: INT8 LM Head v2 (applied at runtime)
+COPY patches/03-int8-lm-head/patch_int8_lmhead.py /opt/patches/patch_int8_lmhead.py
+
+# Patch 3: TurboQuant (applied at runtime)
+COPY patches/04-turboquant/patch_turboquant_v2.py /opt/patches/patch_turboquant.py
+COPY patches/04-turboquant/turboquant_kv_cache.py /opt/patches/tq_src/ops/turboquant_kv_cache.py
+COPY patches/04-turboquant/turboquant_metadata.py /opt/patches/tq_src/ops/turboquant_metadata.py
+COPY patches/04-turboquant/triton_turboquant_decode.py /opt/patches/tq_src/ops/triton_turboquant_decode.py
+COPY patches/04-turboquant/triton_turboquant_kv_update.py /opt/patches/tq_src/ops/triton_turboquant_kv_update.py
+COPY patches/04-turboquant/selector.py /opt/patches/tq_src/selector.py
+COPY patches/04-turboquant/triton_attn.py /opt/patches/tq_src/backends/triton_attn.py
+COPY patches/04-turboquant/kv_cache_interface.py /opt/patches/tq_src/kv_cache_interface.py
+
+# Entrypoint applies all patches, then starts vLLM
+COPY docker/entrypoint-v2-tq.sh /opt/entrypoint.sh
+RUN chmod +x /opt/entrypoint.sh
+
+ENTRYPOINT ["/opt/entrypoint.sh"]
+CMD ["serve", "--help"]
