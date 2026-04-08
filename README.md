@@ -49,6 +49,39 @@ All optimizations are independent — pick what you need:
 | **MTP only** (easiest) | 0 → 2 → 3 → 4 → 5 | ~44 | MTP-2 + INT8 LM Head, no hybrid |
 | **Full v2** (recommended) | 0 → 1 → 2 → 3 → 4 → 5 | **51** | All optimizations |
 
+### Automated install (TL;DR)
+
+If you want everything done for you, just run:
+
+```bash
+./install.sh
+```
+or (use after a previous failed build)
+
+```bash
+./install.sh --no-cache
+```
+
+This walks through Steps 0-4 automatically with progress bars, elapsed time, and a final prompt to launch the container. It is idempotent — re-running skips steps whose outputs already exist.
+
+The script never invokes `sudo` itself: if a prerequisite is missing (`python3-venv`, docker daemon access, etc.) it prints the exact `sudo` command you should run, then exits non-zero so you can fix it and re-run.
+
+Useful flags:
+
+```bash
+./install.sh --launch       # build, then auto-launch container (no prompt)
+./install.sh --no-launch    # build only, never prompt for launch
+./install.sh --no-cache     # nuke existing images + BuildKit cache and rebuild
+                            # from scratch (use after a previous failed build)
+./install.sh --help         # full flag reference
+```
+
+If you prefer to do it step-by-step manually (or want to understand what the script does), follow Steps 0-4 below — the script runs exactly the same commands.
+
+Out of scope for `install.sh`: the TurboQuant variant (see "Optional: TurboQuant KV Cache Compression" later) and the runtime Step 6 benchmark.
+
+---
+
 ### Host-side Python environment
 
 Steps 0-2 run on the host (not inside Docker) and need a small set of Python packages. Pick whichever install style you prefer — both produce the same result.
