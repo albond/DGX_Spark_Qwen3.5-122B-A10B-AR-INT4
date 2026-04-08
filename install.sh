@@ -406,6 +406,118 @@ outside this install script. Benchmark with: ./bench_qwen35.sh "v2"
 EOF
 }
 
+# When the vllm-qwen35 container dies during startup, collect enough info
+# for the user (or us on the forum) to triage without another round-trip.
+# Prints (in order):
+#   1. First EngineCore Error/Traceback block (the real root cause)
+#   2. Last 200 log lines (fallback for errors without a Python traceback)
+#   3. GPU state (who's holding memory, driver version)
+#   4. Host memory pressure
+#   5. /dev/shm size (vLLM multiprocess IPC uses it via --ipc=host)
+#   6. A retry hint — many first-run failures are transient (stale CUDA
+#      contexts from prior experiments), and install.sh re-runs are
+#      idempotent so the fix is usually just "run it again".
+dump_post_mortem() {
+    # Cache the full log once — we're going to slice it three different ways.
+    local log_file="/tmp/vllm-qwen35-crash.log"
+    docker logs vllm-qwen35 > "$log_file" 2>&1
+    local total_lines
+    total_lines=$(wc -l < "$log_file")
+    note "full log saved to $log_file ($total_lines lines)"
+
+    echo
+    err "─── 1. ROOT CAUSE (first EngineCore error/traceback) ─────────────────"
+    # Pass 1: awk for the first block of EngineCore lines starting at the
+    # first Error/Traceback/Exception/Failed/FATAL. Prints up to 40 EngineCore
+    # lines so a full Python traceback fits.
+    local root_cause
+    root_cause=$(awk '
+        /^\(EngineCore/ && /Error|Traceback|Exception|Failed|FATAL/ {found=1}
+        found && /^\(EngineCore/ {print; count++}
+        count >= 40 {exit}
+    ' "$log_file" 2>/dev/null)
+    if [ -n "$root_cause" ]; then
+        echo "$root_cause"
+    else
+        echo "(no EngineCore Python traceback found — crash may be below the"
+        echo " vLLM Python layer. Checking for other error signals below.)"
+    fi
+
+    echo
+    err "─── 2. ALL ERROR/TRACEBACK LINES ACROSS WHOLE LOG ────────────────────"
+    # Pass 2: grep the entire log (not just EngineCore) for any error-ish
+    # line with 2 lines of context before and 5 after. Catches lower-level
+    # crashes: CUDA driver errors, nccl fails, Rust panics, assertion
+    # failures from native .so, shm allocation errors, etc. Dedup via uniq
+    # so repeated warnings don't flood. Cap at 80 lines so we don't dump
+    # megabytes.
+    local any_errors
+    any_errors=$(grep -n -B 2 -A 5 -iE '\b(error|traceback|exception|fatal|failed|panic|assertion|sigkill|signal|core dumped|cannot allocate|out of memory|oom|no such file)\b' "$log_file" 2>/dev/null \
+        | head -80)
+    if [ -n "$any_errors" ]; then
+        echo "$any_errors"
+    else
+        echo "(no explicit error keywords in log — very unusual, see tail)"
+    fi
+
+    echo
+    err "─── 3. LAST 200 LOG LINES (fallback context) ────────────────────────"
+    tail -200 "$log_file"
+
+    echo
+    err "─── HOST DIAGNOSTICS ─────────────────────────────────────────────────"
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        echo "GPU state:"
+        nvidia-smi --query-gpu=name,driver_version,memory.free,memory.used,memory.total \
+            --format=csv 2>&1 | sed 's/^/  /'
+        local running_apps
+        running_apps=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory \
+            --format=csv,noheader 2>&1)
+        if [ -n "$running_apps" ] && [ "$running_apps" != "No running processes found" ]; then
+            echo "Processes currently on GPU:"
+            echo "$running_apps" | sed 's/^/  /'
+        else
+            echo "  (no other processes on GPU)"
+        fi
+    else
+        echo "nvidia-smi not found on host"
+    fi
+
+    echo "Host memory:"
+    free -h 2>&1 | sed 's/^/  /'
+
+    echo "/dev/shm (used by --ipc=host for vLLM multiprocess IPC):"
+    df -h /dev/shm 2>&1 | sed 's/^/  /'
+
+    echo
+    err "─── NEXT STEPS ───────────────────────────────────────────────────────"
+    cat <<EOF
+  1. If there's an EngineCore Python traceback above — that's the real error.
+     Common ones:
+       - 'CUDA out of memory' → another process is holding GPU memory.
+         Check 'Processes currently on GPU' above; stop that process or
+         add '--gpu-memory-utilization 0.70' to the launch command.
+       - 'No such file or directory' for a model shard → Step 1 or Step 2
+         didn't finish. Re-run ./install.sh (it's idempotent).
+       - 'Tokenizer class ... does not exist' → you built with an upstream
+         HEAD of eugr/spark-vllm-docker instead of our pinned commit.
+         Run './install.sh --no-cache' to rebuild from the correct pin.
+
+  2. If you see no Python traceback — the crash was below vLLM's level
+     (CUDA driver, nvidia-container-toolkit, OOM SIGKILL). Try:
+       docker run --rm --gpus all nvidia/cuda:13.2.0-base-ubuntu24.04 nvidia-smi
+     If that fails, install nvidia-container-toolkit:
+       sudo apt install -y nvidia-container-toolkit
+       sudo systemctl restart docker
+
+  3. If everything above looks fine — this may be a transient failure
+     (stale CUDA context from earlier experiments, half-dead worker, etc.).
+     Just re-run the script — it's idempotent and will skip straight to
+     the launch step:
+       ./install.sh --launch
+EOF
+}
+
 # Poll /health while showing a progress bar + the current vLLM startup stage,
 # parsed live from container logs. Returns 0 when /health is 200, non-zero on
 # timeout or container death. Uses 127.0.0.1 (not localhost) to avoid the
@@ -427,15 +539,15 @@ poll_health_with_progress() {
         if [ "$elapsed" -gt "$timeout" ]; then
             echo
             err "timeout after $(fmt_time $elapsed) — vLLM did not become ready"
-            err "check 'docker logs vllm-qwen35' for details"
+            dump_post_mortem
             return 1
         fi
 
         # Container died?
         if ! docker ps --filter name=vllm-qwen35 --format '{{.Names}}' | grep -qx vllm-qwen35; then
             echo
-            err "container 'vllm-qwen35' has died — last 30 log lines:"
-            docker logs vllm-qwen35 2>&1 | tail -30
+            err "container 'vllm-qwen35' has died after $(fmt_time $elapsed)"
+            dump_post_mortem
             return 1
         fi
 
