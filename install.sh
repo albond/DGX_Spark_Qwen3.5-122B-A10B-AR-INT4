@@ -228,12 +228,22 @@ step_end
 
 # ── Step 0: hf download ───────────────────────────────────────────────────────
 step_begin "Step 0 — Downloading Intel/Qwen3.5-122B-A10B-int4-AutoRound" \
-           "first time: ~75 GB; cached: instant"
+           "first time: ~75 GB with progress bars; cached: instant"
 
+# Two-pass approach:
+#   Pass 1 — verbose 'hf download' so the user sees progress bars on a
+#            first-time 75 GB download (no tqdm = looks frozen for 10+ min).
+#   Pass 2 — 'hf download --quiet' is a no-op against the now-populated
+#            cache, but unlike pass 1 it prints *only* the snapshot
+#            directory path on stdout, which is exactly what we need to
+#            capture as INTEL_DIR. This replaces the previous
+#            'find | head -1' dance, which was non-deterministic when
+#            multiple snapshot directories coexisted in cache (e.g. the
+#            user ran 'hf download' at different times and Intel shipped
+#            a new revision in between).
 hf download Intel/Qwen3.5-122B-A10B-int4-AutoRound
-INTEL_DIR=$(find "${HOME}/.cache/huggingface/hub/models--Intel--Qwen3.5-122B-A10B-int4-AutoRound/snapshots" \
-    -maxdepth 1 -mindepth 1 -type d 2>/dev/null | head -1)
-[ -n "$INTEL_DIR" ] || abort "INTEL_DIR not found after hf download — something went wrong."
+INTEL_DIR=$(hf download Intel/Qwen3.5-122B-A10B-int4-AutoRound --quiet)
+[ -d "$INTEL_DIR" ] || abort "INTEL_DIR not found after hf download: '${INTEL_DIR}' is not a directory. Check your HF cache config (HF_HOME, HF_HUB_CACHE)."
 note "INTEL_DIR=${INTEL_DIR}"
 step_end
 
