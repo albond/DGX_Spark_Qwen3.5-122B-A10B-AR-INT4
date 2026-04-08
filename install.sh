@@ -385,20 +385,102 @@ LAUNCH_CMD="docker run -d --name vllm-qwen35 \\
     --attention-backend FLASHINFER \\
     --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'"
 
+# Measured on a real DGX Spark first-launch run from this exact image:
+# weights load 9m45s + compile/warmup 2m51s + graph capture/engine 29s
+# + API server bind 17s = 13m22s total. Use this as the progress estimate.
+EXPECTED_LAUNCH_SECS=802
+
 print_launch_cmd() {
     cat <<EOF
 ${C_CYN}To launch manually later (Step 5 in README):${C_OFF}
 
   $LAUNCH_CMD
 
-Wait ~10 min for model load + warmup, then:
+Wait ~13 min for model load + warmup, then:
 
-  curl localhost:8000/health
+  curl http://127.0.0.1:8000/health
 
 For TurboQuant (4× KV cache, -22% speed) see the "Optional: TurboQuant
 KV Cache Compression" section in README.md — that variant is intentionally
 outside this install script. Benchmark with: ./bench_qwen35.sh "v2"
 EOF
+}
+
+# Poll /health while showing a progress bar + the current vLLM startup stage,
+# parsed live from container logs. Returns 0 when /health is 200, non-zero on
+# timeout or container death. Uses 127.0.0.1 (not localhost) to avoid the
+# IPv6 ::1 resolution gotcha on some Linux setups.
+poll_health_with_progress() {
+    local start_ts now elapsed pct bar_full bar i timeout=1500
+    local stage_marker stage line
+    start_ts=$(date +%s)
+
+    note "model loading takes ~$(fmt_time $EXPECTED_LAUNCH_SECS) on first run (cached re-launch: ~5-7 min)"
+    note "polling http://127.0.0.1:8000/health every 5 sec — Ctrl-C to detach (container keeps running)"
+    echo
+
+    while true; do
+        now=$(date +%s)
+        elapsed=$((now - start_ts))
+
+        # Hard timeout
+        if [ "$elapsed" -gt "$timeout" ]; then
+            echo
+            err "timeout after $(fmt_time $elapsed) — vLLM did not become ready"
+            err "check 'docker logs vllm-qwen35' for details"
+            return 1
+        fi
+
+        # Container died?
+        if ! docker ps --filter name=vllm-qwen35 --format '{{.Names}}' | grep -qx vllm-qwen35; then
+            echo
+            err "container 'vllm-qwen35' has died — last 30 log lines:"
+            docker logs vllm-qwen35 2>&1 | tail -30
+            return 1
+        fi
+
+        # Health probe (silent, just exit code)
+        if curl -sf -m 2 http://127.0.0.1:8000/health -o /dev/null 2>&1; then
+            echo
+            echo
+            ok "${C_GRN}vLLM is ready!${C_OFF}  Total startup: $(fmt_time $elapsed)  ${C_DIM}(estimated $(fmt_time $EXPECTED_LAUNCH_SECS))${C_OFF}"
+            return 0
+        fi
+
+        # Detect current stage by tailing the log for known marker lines
+        stage_marker=$(docker logs vllm-qwen35 2>&1 | grep -oE 'Loading safetensors checkpoint shards: *[0-9]+%|Loading weights took|torch\.compile took|DGX_SPARK_V2: LM Head|Graph capturing finished|init engine.*took|Starting vLLM server|Started server process|Application startup complete' 2>/dev/null | tail -1)
+
+        case "$stage_marker" in
+            *"Application startup complete"*) stage="API server up — verifying health" ;;
+            *"Started server process"*)       stage="FastAPI / uvicorn starting" ;;
+            *"Starting vLLM server"*)         stage="API server starting on :8000" ;;
+            *"init engine"*"took"*)           stage="Engine init done — handing off to API server" ;;
+            *"Graph capturing finished"*)     stage="CUDA graphs captured — finalizing" ;;
+            *"DGX_SPARK_V2: LM Head"*)        stage="INT8 LM Head v2 patch applied — capturing CUDA graphs" ;;
+            *"torch.compile took"*)           stage="torch.compile done — running profiling/warmup" ;;
+            *"Loading weights took"*)         stage="Weights loaded — torch.compile starting" ;;
+            *"Loading safetensors"*)
+                pct=$(echo "$stage_marker" | grep -oE '[0-9]+%' | tail -1)
+                stage="Loading weights ${pct}"
+                ;;
+            *) stage="initializing (entrypoint, vLLM CLI)" ;;
+        esac
+
+        # Build progress bar (24 chars wide). Cap at 99% until health is OK.
+        pct=$((elapsed * 100 / EXPECTED_LAUNCH_SECS))
+        [ "$pct" -gt 99 ] && pct=99
+        bar_full=$((pct * 24 / 100))
+        bar=""
+        for ((i=0; i<24; i++)); do
+            if [ "$i" -lt "$bar_full" ]; then bar+="█"; else bar+="░"; fi
+        done
+
+        # Single-line progress (\r overwrite, \033[K clears to end of line)
+        line="  ${C_CYN}[%3d%%]${C_OFF} ${bar}  ${C_DIM}%s / ~%s${C_OFF}  %s"
+        printf '\r\033[K'"$line" "$pct" "$(fmt_time $elapsed)" "$(fmt_time $EXPECTED_LAUNCH_SECS)" "$stage"
+
+        sleep 5
+    done
 }
 
 do_launch() {
@@ -420,10 +502,23 @@ do_launch() {
     # Launch
     eval "$LAUNCH_CMD" || { err "docker run failed"; return 1; }
     ok "container started in background as 'vllm-qwen35'"
-    note "model loading takes ~10 min on first run (then warmup)"
-    note "tail logs: docker logs -f vllm-qwen35"
-    note "health:    curl localhost:8000/health   (returns once ready)"
-    note "stop:      docker stop vllm-qwen35"
+
+    # Poll /health with live progress + stage parsing
+    if poll_health_with_progress; then
+        echo
+        note "endpoint: http://127.0.0.1:8000/v1/chat/completions"
+        note "health:   curl http://127.0.0.1:8000/health"
+        note "logs:     docker logs -f vllm-qwen35"
+        note "stop:     docker stop vllm-qwen35"
+
+        # Smoke test: hit /v1/models so we know it's not just /health alive
+        if curl -sf -m 5 http://127.0.0.1:8000/v1/models -o /tmp/.vllm_models.$$ 2>/dev/null; then
+            if grep -q '"qwen"' /tmp/.vllm_models.$$ 2>/dev/null; then
+                ok "model 'qwen' is registered and serving requests"
+            fi
+            rm -f /tmp/.vllm_models.$$
+        fi
+    fi
 }
 
 case "$LAUNCH_MODE" in
