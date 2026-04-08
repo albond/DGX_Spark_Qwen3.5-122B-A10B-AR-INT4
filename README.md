@@ -59,7 +59,7 @@ Steps 0-2 run on the host (not inside Docker) and need a small set of Python pac
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
-pip install torch safetensors "huggingface_hub[cli]"
+pip install torch safetensors huggingface_hub
 ```
 
 Keep this venv active for the rest of Steps 0-2. Step 3 onward runs inside Docker and does not use the host venv.
@@ -67,7 +67,7 @@ Keep this venv active for the rest of Steps 0-2. Step 3 onward runs inside Docke
 **Option B — system-wide (quick & dirty):**
 
 ```bash
-pip install --break-system-packages torch safetensors "huggingface_hub[cli]"
+pip install --break-system-packages torch safetensors huggingface_hub
 ```
 
 On recent Ubuntu (24.04+), a plain `pip install` is blocked by PEP 668, hence the `--break-system-packages` flag. This works fine for a one-shot model prep but pollutes your global Python — if you ever use this machine for anything else, prefer Option A.
@@ -77,9 +77,11 @@ On recent Ubuntu (24.04+), a plain `pip install` is blocked by PEP 668, hence th
 ### Step 0: Download the model
 
 ```bash
-huggingface-cli download Intel/Qwen3.5-122B-A10B-int4-AutoRound
+hf download Intel/Qwen3.5-122B-A10B-int4-AutoRound
 INTEL_DIR=$(find ~/.cache/huggingface/hub/models--Intel--Qwen3.5-122B-A10B-int4-AutoRound/snapshots -maxdepth 1 -mindepth 1 -type d)
 ```
+
+> **Note:** `huggingface_hub` 1.x renamed the CLI from `huggingface-cli` to `hf`. If you installed an older version (0.x), use `huggingface-cli download ...` instead.
 
 ### Step 1: Build hybrid checkpoint *(optional, +9%)*
 
@@ -116,6 +118,15 @@ DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from Py
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
+
+# Remove two "TEMPORARY PATCH" RUN blocks that curl-apply vLLM PRs 35568
+# and 38919. Both target main-branch bugs that don't affect v0.19.0, and
+# both PRs were force-pushed after 2026-04-04, so their current .diff no
+# longer applies to v0.19.0 at all. Our reference image was built without
+# them (verified by MD5 comparison against pristine v0.19.0).
+sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
+sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
+
 ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 cd ..
 ```
@@ -125,6 +136,8 @@ This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121).
 > **Why `build-and-copy.sh` and not `docker build` directly:** the upstream Dockerfile does `COPY build-metadata.yaml`, and that file is generated *at build time* by `build-and-copy.sh` (and removed after). A plain `docker build` will fail with `"/build-metadata.yaml": not found`.
 >
 > **Why `--tf5` and `--vllm-ref v0.19.0`:** our image was built with `transformers_5: true` and `vllm_ref: v0.19.0` (read from `/workspace/build-metadata.yaml` inside the image). The script's defaults are different, and an image built with defaults will not be binary-compatible with our patches.
+>
+> **Why the two `sed` commands:** the upstream Dockerfile at `49d6d9f` has two hardcoded `RUN curl ... .diff | git apply` blocks that pull vLLM PRs 35568 and 38919 live from GitHub. Both PRs target bugs in `main`, not in `v0.19.0`, and both were force-pushed after our original 2026-04-04 build, so their current diffs no longer apply to `v0.19.0` (they reference files moved under `csrc/libtorch_stable/` which didn't exist yet at that path in `v0.19.0`). We verified via MD5 comparison that `marlin_utils.py` inside our reference image is byte-identical to pristine `v0.19.0` — i.e. PR 35568 was never actually applied to our image in the first place. Removing the two blocks reproduces the original build.
 
 > **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`, eugr/spark-vllm-docker commit `49d6d9f`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
 
@@ -224,10 +237,12 @@ DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built ima
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
+sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
+sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
 ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 ```
 
-Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
+Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The two `sed` commands strip out upstream "TEMPORARY PATCH" RUN blocks that curl-fetch vLLM PRs 35568 and 38919 from live GitHub URLs; those PRs target main-branch bugs that don't apply to `v0.19.0`, and both were force-pushed after 2026-04-04. The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
 
 If building manually, the critical environment variables are:
 
