@@ -49,6 +49,31 @@ All optimizations are independent — pick what you need:
 | **MTP only** (easiest) | 0 → 2 → 3 → 4 → 5 | ~44 | MTP-2 + INT8 LM Head, no hybrid |
 | **Full v2** (recommended) | 0 → 1 → 2 → 3 → 4 → 5 | **51** | All optimizations |
 
+### Host-side Python environment
+
+Steps 0-2 run on the host (not inside Docker) and need a small set of Python packages. Pick whichever install style you prefer — both produce the same result.
+
+**Option A — virtualenv (recommended, clean):**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install torch safetensors "huggingface_hub[cli]"
+```
+
+Keep this venv active for the rest of Steps 0-2. Step 3 onward runs inside Docker and does not use the host venv.
+
+**Option B — system-wide (quick & dirty):**
+
+```bash
+pip install --break-system-packages torch safetensors "huggingface_hub[cli]"
+```
+
+On recent Ubuntu (24.04+), a plain `pip install` is blocked by PEP 668, hence the `--break-system-packages` flag. This works fine for a one-shot model prep but pollutes your global Python — if you ever use this machine for anything else, prefer Option A.
+
+> Note: `torch` is only needed by the Step 1 hybrid-checkpoint script; Steps 0 and 2 use just `huggingface_hub` and the stdlib. If you're taking the MTP-only path and skipping Step 1, you can drop `torch` from the install list.
+
 ### Step 0: Download the model
 
 ```bash
@@ -61,9 +86,6 @@ INTEL_DIR=$(find ~/.cache/huggingface/hub/models--Intel--Qwen3.5-122B-A10B-int4-
 Replaces BF16 shared expert weights with FP8 from the official Qwen checkpoint. Skip this if you just want MTP — the Docker image works with both hybrid and non-hybrid checkpoints (the FP8 dispatch simply doesn't activate if no FP8 weights are present).
 
 ```bash
-# Install dependencies (if not already present)
-pip install --break-system-packages torch safetensors transformers huggingface_hub
-
 python patches/01-hybrid-int4-fp8/build-hybrid-checkpoint.py \
     --gptq-dir "$INTEL_DIR" \
     --fp8-repo Qwen/Qwen3.5-122B-A10B-FP8 \
@@ -88,18 +110,23 @@ python patches/02-mtp-speculative/add-mtp-weights.py \
 
 ### Step 3: Build base vLLM image for SM121
 
-DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from PyPI don't support this architecture. Use [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker):
+DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from PyPI don't support this architecture. Use [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) at the exact commit we tested against:
 
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-docker build -t vllm-sm121 .
+git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
+./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 cd ..
 ```
 
 This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121).
 
-> **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
+> **Why `build-and-copy.sh` and not `docker build` directly:** the upstream Dockerfile does `COPY build-metadata.yaml`, and that file is generated *at build time* by `build-and-copy.sh` (and removed after). A plain `docker build` will fail with `"/build-metadata.yaml": not found`.
+>
+> **Why `--tf5` and `--vllm-ref v0.19.0`:** our image was built with `transformers_5: true` and `vllm_ref: v0.19.0` (read from `/workspace/build-metadata.yaml` inside the image). The script's defaults are different, and an image built with defaults will not be binary-compatible with our patches.
+
+> **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`, eugr/spark-vllm-docker commit `49d6d9f`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
 
 ### Step 4: Build v2 image
 
@@ -191,13 +218,16 @@ These exact versions were used for all benchmarks. Mismatched versions may cause
 
 ### Building vLLM 0.19 for SM121 (DGX Spark)
 
-DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built images for this architecture, so you need to compile from source. The recommended approach is [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) which handles all SM121 specifics:
+DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built images for this architecture, so you need to compile from source. The recommended approach is [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) which handles all SM121 specifics. Use the exact commit we tested against — upstream Dockerfiles change frequently:
 
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
-docker build -t vllm-sm121 .
+git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
+./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 ```
+
+Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
 
 If building manually, the critical environment variables are:
 
