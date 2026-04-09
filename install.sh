@@ -392,6 +392,8 @@ LAUNCH_CMD="docker run -d --name vllm-qwen35 \\
     --max-model-len 262144 \\
     --gpu-memory-utilization 0.90 \\
     --reasoning-parser qwen3 \\
+    --enable-auto-tool-choice \\
+    --tool-call-parser qwen3_xml \\
     --attention-backend FLASHINFER \\
     --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'"
 
