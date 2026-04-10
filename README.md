@@ -56,11 +56,6 @@ If you want everything done for you, just run:
 ```bash
 ./install.sh
 ```
-or (use after a previous failed build)
-
-```bash
-./install.sh --no-cache
-```
 
 This walks through Steps 0-4 automatically with progress bars, elapsed time, and a final prompt to launch the container. It is idempotent — re-running skips steps whose outputs already exist.
 
@@ -215,6 +210,71 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 Expected: ~51 tok/s with hybrid, ~44 tok/s without hybrid (Run 2; Run 1 is JIT warmup).
+
+### Running in Production
+
+The launch command in Step 5 (and `install.sh`) is a minimal smoke test. For daily use, you'll likely want a custom launch script tailored to your setup. Here's a community example from [@whpthomas](https://github.com/whpthomas) that demonstrates common production flags:
+
+**`run-qwen.sh`** — start the server:
+
+```bash
+#!/bin/bash
+docker rm vllm-qwen35
+sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+docker run -it --name vllm-qwen35 \
+  --gpus all --net=host --ipc=host \
+  -v ~/models:/models \
+  vllm-qwen35-v2 \
+  serve /models/qwen35-122b-hybrid-int4fp8 \
+  --served-model-name qwen/qwen3.5 \
+  --max-model-len 196608 \
+  --max-num-batched-tokens 32768 \
+  --gpu-memory-utilization 0.88 \
+  --port 8000 \
+  --host 0.0.0.0 \
+  --load-format fastsafetensors \
+  --attention-backend FLASHINFER \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+  --enable-prefix-caching \
+  --enable-chunked-prefill \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --generation-config auto \
+  --override-generation-config '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 0.0, "repetition_penalty": 1.0}'
+```
+
+**`stop-qwen.sh`** — stop the server:
+
+```bash
+#!/bin/bash
+docker stop $(docker ps -q --filter "name=vllm")
+```
+
+Notable flags in this example:
+
+| Flag | Purpose |
+|---|---|
+| `sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'` | Flush page cache before launch for consistent memory |
+| `--host 0.0.0.0` | Listen on all interfaces (LAN access) |
+| `--load-format fastsafetensors` | Faster checkpoint loading |
+| `--enable-chunked-prefill` | Better TTFT on long prompts |
+| `--enable-auto-tool-choice --tool-call-parser ...` | Agent/tool-calling support (see note below) |
+| `--override-generation-config '{...}'` | Server-side sampling defaults |
+
+> **Adapt to your needs.** These are suggestions, not requirements. The only flags critical for this project's optimizations are `--attention-backend FLASHINFER` and `--speculative-config`. Everything else depends on your use case. See [vLLM documentation](https://docs.vllm.ai/) for the full flag reference.
+>
+> **Note on `--enable-prefix-caching`:** This may conflict with DeltaNet hybrid attention on some workloads (see Troubleshooting). Test with your specific prompts.
+
+**Tool-call parser options:** vLLM ships two parsers for Qwen models. Pick the one that matches your model:
+
+| Parser | Format | Models |
+|---|---|---|
+| `qwen3_xml` | `<tool_call>{"name": "fn", "arguments": {...}}</tool_call>` (JSON in XML tags) | **Qwen3.5-\***, Qwen3-\*-Instruct |
+| `qwen3_coder` | `<tool_call><function=fn><parameter=x>val</parameter></function></tool_call>` (custom XML) | Qwen3-Coder-\* |
+
+For Qwen3.5-122B (this project), use `--tool-call-parser qwen3_xml`. The example above uses `qwen3_coder` which also works but is designed for Coder-series models.
+
+> **Known issue (vLLM 0.19):** When `--reasoning-parser qwen3` and `--tool-call-parser` are both active, tool calls emitted inside `<think>` blocks may be silently dropped in non-streaming mode ([vllm#39056](https://github.com/vllm-project/vllm/issues/39056)).
 
 ### Troubleshooting
 
