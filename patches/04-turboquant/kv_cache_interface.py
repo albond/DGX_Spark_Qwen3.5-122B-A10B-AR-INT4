@@ -13,9 +13,11 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.ops.turboquant_kv_cache import (
+    get_q8k_packed_bytes,
     get_turboquant_bits,
     get_turboquant_packed_dim,
     is_turboquant_kv_cache,
+    is_turboquant_q8k,
 )
 
 logger = init_logger(__name__)
@@ -27,6 +29,11 @@ def _get_attention_entry_size_bytes(
     cache_dtype_str: str | None,
 ) -> int:
     if cache_dtype_str is not None and is_turboquant_kv_cache(cache_dtype_str):
+        if is_turboquant_q8k(cache_dtype_str):
+            # K=Q8 format dominates: head_size + 2 bytes per head.
+            # Both K and V slots use this size so the [2,...,packed_dim] layout
+            # stays uniform.  V writes its TQ payload into the first N bytes.
+            return get_q8k_packed_bytes(head_size)
         bits = get_turboquant_bits(cache_dtype_str)
         return get_turboquant_packed_dim(head_size, bits)
     return head_size * get_dtype_size(dtype)

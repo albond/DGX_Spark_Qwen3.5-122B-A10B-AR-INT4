@@ -44,6 +44,9 @@ from vllm.v1.attention.ops.triton_turboquant_kv_update import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     TurboQuantLayout,
+    dequantize_turboquant_vectors,
+    get_q8k_packed_bytes,
+    get_turboquant_base_dtype,
     get_turboquant_bits,
     get_turboquant_centroids,
     get_turboquant_group_dims,
@@ -56,7 +59,11 @@ from vllm.v1.attention.ops.turboquant_kv_cache import (
     get_turboquant_qjl_matrix,
     get_turboquant_qjl_transform_matrix,
     get_turboquant_rotation,
+    is_turboquant_asym,
     is_turboquant_kv_cache,
+    is_turboquant_q8k,
+    pack_q8k_to_uint8,
+    unpack_q8k_from_cache,
 )
 from vllm.v1.attention.ops.turboquant_metadata import (
     TurboQuantLayerMetadata,
@@ -505,8 +512,18 @@ class TritonAttentionImpl(AttentionImpl):
         self.attn_type = attn_type
         self.fp8_dtype = current_platform.fp8_dtype()
         self.turboquant_bits = (
-            get_turboquant_bits(kv_cache_dtype)
+            # Use the base storage dtype so that asym meta-recipes resolve to
+            # the correct bit-width (e.g. "turboquant_asym" → "turboquant35" → 3.5).
+            # For Q8K: base dtype is the V-side TQ recipe, so bits are V-side bits.
+            get_turboquant_bits(get_turboquant_base_dtype(kv_cache_dtype))
             if is_turboquant_kv_cache(kv_cache_dtype)
+            else None
+        )
+        # For Q8K recipes: the V-side TQ recipe name (e.g. "turboquant35").
+        # Used to select the correct TQ layout for V encode/decode.
+        self.q8k_v_dtype: str | None = (
+            get_turboquant_base_dtype(kv_cache_dtype)
+            if is_turboquant_q8k(kv_cache_dtype)
             else None
         )
         self._turboquant_tables: dict[
@@ -592,6 +609,9 @@ class TritonAttentionImpl(AttentionImpl):
                     scope="local",
                 )
             if self._turboquant_metadata.recipe != self.kv_cache_dtype:
+                # Allow asymmetric meta-recipe: metadata carries the same name as
+                # the kv_cache_dtype (e.g. "turboquant_asym"), not the underlying
+                # storage recipe ("turboquant35").
                 raise ValueError(
                     "TurboQuant metadata recipe does not match kv_cache_dtype: "
                     f"{self._turboquant_metadata.recipe} vs {self.kv_cache_dtype}."
@@ -636,8 +656,12 @@ class TritonAttentionImpl(AttentionImpl):
         cache_key = (device.type, device.index)
         tables = self._turboquant_tables.get(cache_key)
         if tables is None:
-            group_dims = get_turboquant_group_dims(self.head_size, self.kv_cache_dtype)
-            layout = get_turboquant_layout(self.kv_cache_dtype, self.head_size)
+            # Use the underlying storage recipe for kernel table generation so
+            # that asymmetric meta-recipes (e.g. "turboquant_asym") resolve to
+            # their actual storage format (e.g. "turboquant35").
+            base_dtype = get_turboquant_base_dtype(self.kv_cache_dtype)
+            group_dims = get_turboquant_group_dims(self.head_size, base_dtype)
+            layout = get_turboquant_layout(base_dtype, self.head_size)
             centroid_dims = {
                 group.mse_bits: group.dim
                 for group in layout.groups
@@ -686,7 +710,8 @@ class TritonAttentionImpl(AttentionImpl):
         if tables is not None:
             return tables
 
-        group_dims = get_turboquant_group_dims(self.head_size, self.kv_cache_dtype)
+        base_dtype = get_turboquant_base_dtype(self.kv_cache_dtype)
+        group_dims = get_turboquant_group_dims(self.head_size, base_dtype)
         mse_seed_offsets = (101, 211)
         qjl_seed_offsets = (307, 401)
         tables = (
@@ -728,7 +753,8 @@ class TritonAttentionImpl(AttentionImpl):
         if tables is not None:
             return tables
 
-        group_dims = get_turboquant_group_dims(self.head_size, self.kv_cache_dtype)
+        base_dtype = get_turboquant_base_dtype(self.kv_cache_dtype)
+        group_dims = get_turboquant_group_dims(self.head_size, base_dtype)
         mse_seed_offsets = (101, 211)
         qjl_seed_offsets = (307, 401)
         tables = (
@@ -754,16 +780,19 @@ class TritonAttentionImpl(AttentionImpl):
             return masks
         if self._turboquant_layer_metadata is None:
             raise RuntimeError("TurboQuant metadata is not initialized.")
+        # For asymmetric recipes pass the base storage dtype so that the outlier
+        # count validation uses the correct ratio (e.g. 50% for TQ35-based asym).
+        base_dtype = get_turboquant_base_dtype(self.kv_cache_dtype)
         masks = (
             self._turboquant_layer_metadata.key.get_group_indices(
                 device=device,
                 head_size=self.head_size,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=base_dtype,
             ),
             self._turboquant_layer_metadata.value.get_group_indices(
                 device=device,
                 head_size=self.head_size,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=base_dtype,
             ),
         )
         self._turboquant_masks[cache_key] = masks
@@ -1068,6 +1097,13 @@ class TritonAttentionImpl(AttentionImpl):
                 return
 
             assert self.turboquant_bits is not None
+
+            if is_turboquant_q8k(self.kv_cache_dtype):
+                self._do_q8k_kv_cache_update(
+                    key, value, key_cache, value_cache, slot_mapping
+                )
+                return
+
             _, _, centroids, _, layout = self._get_turboquant_tables(key.device)
             key_masks, value_masks = self._ensure_turboquant_masks(key.device)
             mse_transform_matrices, qjl_transform_matrices, mse_to_qjl_matrices = (
@@ -1177,6 +1213,114 @@ class TritonAttentionImpl(AttentionImpl):
             flash_layout,
             is_fp8_kv_cache,
         )
+
+    def _do_q8k_kv_cache_update(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write K as Q8 (int8 + fp16 scale) and V as TurboQuant into paged cache.
+
+        K is encoded with per-head int8 quantization:
+            [scale_lo, scale_hi, val[0]..val[D-1]]  (head_size + 2 bytes / head)
+
+        V is encoded with the underlying V-side TQ recipe and written into the
+        first N bytes of each value_cache slot.  The remaining bytes are left
+        as-is (zero on fresh allocation) — they are never read during decode.
+        """
+        # ── Encode K as Q8 and scatter into key_cache pages ──
+        packed_k = pack_q8k_to_uint8(key, self.head_size)  # [T, H, 2+D] uint8
+        block_size = key_cache.shape[1]  # key_cache: [blocks, block_size, H, packed_dim]
+        block_idx = (slot_mapping // block_size).long()
+        block_off = (slot_mapping % block_size).long()
+        key_cache[block_idx, block_off] = packed_k  # scatter [T, H, packed_dim]
+
+        # ── Encode V as TQ and scatter into value_cache pages ──
+        assert self.q8k_v_dtype is not None
+        _, _, centroids, _, v_layout = self._get_turboquant_tables(key.device)
+        _, value_masks = self._ensure_turboquant_masks(key.device)
+        mse_transform_matrices, qjl_transform_matrices, mse_to_qjl_matrices = (
+            self._get_turboquant_update_tables(key.device)
+        )
+        turboquant_write_packed_kv(
+            x=value,
+            cache=value_cache,
+            slot_mapping=slot_mapping,
+            layout=v_layout,
+            group_indices=value_masks,
+            mse_transform_matrices=mse_transform_matrices,
+            qjl_transform_matrices=qjl_transform_matrices,
+            mse_to_qjl_matrices=mse_to_qjl_matrices,
+            centroids=centroids,
+        )
+
+    def _dequantize_q8k_kv_from_cache(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather and dequantize K (Q8) and V (TQ) from paged cache.
+
+        Returns:
+            keys:   float16 tensor of shape [total_kv_tokens, num_kv_heads, head_size]
+            values: float16 tensor of shape [total_kv_tokens, num_kv_heads, head_size]
+
+        Tokens are laid out in sequence order so they can be passed directly to
+        _fallback_turboquant_attention.
+        """
+        assert self.q8k_v_dtype is not None
+        block_size = key_cache.shape[1]
+        seq_lens_cpu = attn_metadata.seq_lens_cpu.tolist()
+        block_table = attn_metadata.block_table
+
+        # Build per-token sequence ids and positions within each sequence.
+        # These stay on CPU and are then transferred as index tensors.
+        seq_ids_list: list[int] = []
+        token_pos_list: list[int] = []
+        for seq_idx, seq_len in enumerate(seq_lens_cpu):
+            seq_ids_list.extend([seq_idx] * seq_len)
+            token_pos_list.extend(range(seq_len))
+
+        device = key_cache.device
+        seq_ids_t = torch.tensor(seq_ids_list, device=device, dtype=torch.long)
+        token_pos_t = torch.tensor(token_pos_list, device=device, dtype=torch.long)
+
+        block_num_t = token_pos_t // block_size
+        block_off_t = token_pos_t % block_size
+        # block_table[seq_ids_t, block_num_t] → physical block for each token
+        block_idx_t = block_table[seq_ids_t, block_num_t].long()
+
+        # Gather packed cache slots for all tokens.
+        # key_cache shape: [num_blocks, block_size, num_kv_heads, packed_dim]
+        k_packed = key_cache[block_idx_t, block_off_t]   # [T, H, packed_dim]
+        v_packed = value_cache[block_idx_t, block_off_t]  # [T, H, packed_dim]
+
+        # Dequantize K from Q8.
+        keys_fp16 = unpack_q8k_from_cache(k_packed, self.head_size)  # [T, H, D] fp16
+
+        # Dequantize V from TQ.  Slice off only the TQ payload bytes (leading bytes).
+        v_dtype = self.q8k_v_dtype
+        v_layout = get_turboquant_layout(v_dtype, self.head_size)
+        v_tq_packed = v_packed[..., : v_layout.packed_dim]  # [T, H, tq_packed_dim]
+
+        rotations, qjl_matrices, centroids, _, _ = self._get_turboquant_tables(device)
+        _, value_masks = self._ensure_turboquant_masks(device)
+        values_fp16 = dequantize_turboquant_vectors(
+            packed=v_tq_packed,
+            kv_cache_dtype=v_dtype,
+            head_size=self.head_size,
+            rotations=rotations,
+            qjl_matrices=qjl_matrices,
+            centroids=centroids,
+            group_indices=value_masks,
+            dtype=torch.float16,
+        )  # [T, H, D] fp16
+
+        return keys_fp16, values_fp16
 
     def _fallback_turboquant_attention(
         self,
@@ -1346,6 +1490,21 @@ class TritonAttentionImpl(AttentionImpl):
             )
             return output
 
+        # Q8K path: K is stored as int8, V as TurboQuant.
+        # Dequantize both from the paged cache, then run the Python fallback.
+        if is_turboquant_q8k(self.kv_cache_dtype):
+            keys_fp16, values_fp16 = self._dequantize_q8k_kv_from_cache(
+                key_cache, value_cache, attn_metadata
+            )
+            self._fallback_turboquant_attention(
+                query=query,
+                key=keys_fp16,
+                value=values_fp16,
+                output=output,
+                attn_metadata=attn_metadata,
+            )
+            return output
+
         assert self.turboquant_bits is not None
         self._validate_turboquant_device(query.device)
         rotations, qjl_matrices, centroids, norm_lut, _ = self._get_turboquant_tables(
@@ -1419,7 +1578,7 @@ class TritonAttentionImpl(AttentionImpl):
                 centroids=centroids,
                 norm_lut=norm_lut,
                 softmax_scale=self.scale,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=get_turboquant_base_dtype(self.kv_cache_dtype),
                 token_seq_ids=prefix_seq_ids,
                 token_kv_lens=prefix_kv_lens,
                 token_query_positions=prefix_query_positions,
@@ -1467,7 +1626,7 @@ class TritonAttentionImpl(AttentionImpl):
                 centroids=centroids,
                 norm_lut=norm_lut,
                 softmax_scale=self.scale,
-                kv_cache_dtype=self.kv_cache_dtype,
+                kv_cache_dtype=get_turboquant_base_dtype(self.kv_cache_dtype),
                 token_seq_ids=suffix_seq_ids,
                 token_kv_lens=suffix_kv_lens,
                 token_query_positions=suffix_query_positions,
@@ -1510,7 +1669,7 @@ class TritonAttentionImpl(AttentionImpl):
             centroids=centroids,
             norm_lut=norm_lut,
             softmax_scale=self.scale,
-            kv_cache_dtype=self.kv_cache_dtype,
+            kv_cache_dtype=get_turboquant_base_dtype(self.kv_cache_dtype),
             token_seq_ids=token_seq_ids,
             token_kv_lens=token_kv_lens,
             token_query_positions=token_query_positions,

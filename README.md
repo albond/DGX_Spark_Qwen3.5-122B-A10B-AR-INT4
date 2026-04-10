@@ -453,17 +453,52 @@ We also developed and benchmarked a **custom CUDA fused kernel** that computes a
 - The current INT4 quantization (Intel AutoRound) was calibrated for standard context lengths. For deeper contexts (>256K), a custom AutoRound calibration would be needed.
 - The 1.4M token KV cache theoretically supports ~1M context, but model quality beyond 256K is unverified.
 
+### TurboQuant Recipes
+
+The `generate_tq_metadata.py` script supports multiple recipes. Choose based on your trade-off between memory, speed, and quality:
+
+| Recipe | K Storage | V Storage | Memory vs fp16 | Outlier Dims | Best For |
+|--------|-----------|-----------|----------------|--------------|----------|
+| `turboquant35` | TQ35 | TQ35 | 4× (128B/head) | 50% K+V same | Default, balanced |
+| `turboquant25` | TQ25 | TQ25 | 5× (108B/head) | 25% K+V same | Maximum compression |
+| `turboquant_asym` | TQ35 | TQ35 | 4× (128B/head) | 50% K≠V disjoint | Better needle retrieval |
+| `turboquant_q8k_tq35v` | int8 | TQ35 | ~2× (258B/head) | K=full, V=50% | Best quality |
+| `turboquant_q8k_tq25v` | int8 | TQ25 | ~2× (258B/head) | K=full, V=25% | Quality + V compression |
+
+**Recipe details:**
+
+- **`turboquant35`** (default): Symmetric 3.5-bit encoding. First 50% of dimensions are high-precision outliers for both K and V. Best balance of compression and quality.
+
+- **`turboquant25`**: More aggressive 2.5-bit encoding. Only 25% of dimensions are high-precision outliers. Higher compression ratio but more reconstruction error.
+
+- **`turboquant_asym`** (Asymmetric): Same storage as TQ35 (128B/head), but K uses the first 50% of dimensions while V uses the last 50%. This disjoint selection decorrelates K and V index sets, improving reconstruction quality for long-context needle-in-haystack tasks without extra memory cost.
+
+- **`turboquant_q8k_tq35v`** (True Asymmetric): K stored as int8 + fp16 scale (258 bytes/head), V stored as TQ35. ~2× memory overhead vs fp16 (vs 4× for symmetric TQ). K's full int8 precision preserves attention score quality, while V's TQ compression reduces the overall footprint. Recovers needle-in-haystack quality to 3/3 at 256K context (vs 0/3 with symmetric TQ35).
+
+- **`turboquant_q8k_tq25v`**: Same as above but V uses TQ25 (25% outlier dims). Same memory as q8k-tq35v, more aggressive V compression.
+
 ### Build & Run (TQ variant)
 
 ```bash
 # 1. Generate TQ metadata (one-time, places turboquant_kv.json in model dir)
+#    Default: symmetric TQ35
 python patches/04-turboquant/generate_tq_metadata.py \
     --model-dir ~/models/qwen35-122b-hybrid-int4fp8
+
+#    Asymmetric (disjoint K/V outlier dims):
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant_asym
+
+#    Q8K (K=int8, V=TQ35 - best quality):
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant_q8k_tq35v
 
 # 2. Build TQ image
 docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
 
-# 3. Run
+# 3. Run (match --kv-cache-dtype to the recipe used for metadata generation)
 docker run -d --name vllm-qwen35-tq \
   --gpus all --net=host -v ~/models:/models \
   vllm-qwen35-v2-tq \
@@ -478,12 +513,16 @@ docker run -d --name vllm-qwen35-tq \
 
 > **First launch is slow (~15-20 min vs ~10 min for v2).** TQ patches modify vLLM internals at startup, and the Triton decode kernels are JIT-compiled on first run. Subsequent launches with cached Triton kernels are faster.
 
+> **Important:** The `--kv-cache-dtype` must match the recipe used when generating metadata. Mismatched recipes will cause runtime errors or degraded quality.
+
 ### TQ Benchmarks
 
-| Config | tok/s | KV Cache | Concurrent @ 256K |
-|---|---|---|---|
-| v2 (standard) | **51** | 355K | 1 |
-| v2-tq | 39 (-22%) | 1.4M | 5 |
+| Config | tok/s | KV Cache | Concurrent @ 256K | Memory/head | Notes |
+|---|---|---|---|---|---|
+| v2 (standard) | **51** | 355K | 1 | 512B (fp16) | Baseline |
+| v2-tq (TQ35) | 39 (-22%) | 1.4M | 5 | 128B | Best memory efficiency |
+| v2-tq-asym | ~39 | 1.4M | 5 | 128B | Better long-context retrieval |
+| v2-tq-q8k-tq35v | ~35 (-31%) | ~700K | ~3 | 258B | Best quality, 2× memory |
 
 ---
 
