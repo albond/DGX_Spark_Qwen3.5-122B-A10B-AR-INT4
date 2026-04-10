@@ -235,7 +235,6 @@ docker run -it --name vllm-qwen35 \
   --load-format fastsafetensors \
   --attention-backend FLASHINFER \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
-  --enable-prefix-caching \
   --enable-chunked-prefill \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
@@ -263,7 +262,7 @@ Notable flags in this example:
 
 > **Adapt to your needs.** These are suggestions, not requirements. The only flags critical for this project's optimizations are `--attention-backend FLASHINFER` and `--speculative-config`. Everything else depends on your use case. See [vLLM documentation](https://docs.vllm.ai/) for the full flag reference.
 >
-> **Note on `--enable-prefix-caching`:** This may conflict with DeltaNet hybrid attention on some workloads (see Troubleshooting). Test with your specific prompts.
+> **Note:** `--enable-prefix-caching` is intentionally omitted — it crashes on Qwen3.5 due to DeltaNet hybrid attention (see Troubleshooting).
 
 **Tool-call parser options:** vLLM ships two parsers for Qwen models. Pick the one that matches your model:
 
