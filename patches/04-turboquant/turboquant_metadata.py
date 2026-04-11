@@ -16,6 +16,14 @@ TURBOQUANT_CODEBOOK_VERSION = "lloyd_beta_v1"
 TURBOQUANT_OUTLIER_RATIOS = {
     "turboquant25": 0.25,
     "turboquant35": 0.50,
+    # Asymmetric: same storage layout as TQ35 but K and V have separately
+    # calibrated outlier-dimension selections.
+    "turboquant_asym": 0.50,
+}
+# For asymmetric recipes, the *effective* storage recipe (used to compute
+# outlier counts for index validation) may differ from the meta-recipe name.
+TURBOQUANT_ASYM_BASE_RECIPE: dict[str, str] = {
+    "turboquant_asym": "turboquant35",
 }
 TURBOQUANT_GROUP_ALIGNMENT = 16
 
@@ -47,10 +55,13 @@ class TurboQuantTensorMetadata:
         head_size: int,
         kv_cache_dtype: str,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Resolve asymmetric meta-recipes to their underlying storage recipe so
+        # that outlier-count validation uses the correct ratio.
+        storage_dtype = TURBOQUANT_ASYM_BASE_RECIPE.get(kv_cache_dtype, kv_cache_dtype)
         high_cpu, low_cpu = _cached_group_indices(
             self.high_precision_indices,
             head_size,
-            kv_cache_dtype,
+            storage_dtype,
         )
         if device.type == "cpu":
             return high_cpu, low_cpu
@@ -323,12 +334,36 @@ def build_default_turboquant_metadata(
     num_kv_heads: int,
     layer_names: list[str],
     model_name: str | None = None,
+    asym: bool = False,
 ) -> TurboQuantMetadata:
-    outlier_count = _get_turboquant_outlier_count(head_size, recipe)
-    default_high = tuple(tuple(range(outlier_count)) for _ in range(num_kv_heads))
+    """Build default TurboQuant metadata.
+
+    When ``asym=True`` (or ``recipe="turboquant_asym"``) the K and V tensors
+    receive *different* default outlier-dimension selections:
+
+    * K  → first ``outlier_count`` dimensions  (same as symmetric default)
+    * V  → last  ``outlier_count`` dimensions  (shifted by half the head size)
+
+    This decorrelates the index sets, which improves reconstruction quality
+    for V at no extra storage cost (both still use TQ35 packed format).
+    """
+    storage_recipe = TURBOQUANT_ASYM_BASE_RECIPE.get(recipe, recipe)
+    outlier_count = _get_turboquant_outlier_count(head_size, storage_recipe)
+    asym_mode = asym or recipe in TURBOQUANT_ASYM_BASE_RECIPE
+
+    key_high = tuple(tuple(range(outlier_count)) for _ in range(num_kv_heads))
+    if asym_mode:
+        # V uses the *last* outlier_count dims so its index set is disjoint from K's.
+        v_start = head_size - outlier_count
+        value_high = tuple(
+            tuple(range(v_start, head_size)) for _ in range(num_kv_heads)
+        )
+    else:
+        value_high = key_high
+
     layer_metadata = TurboQuantLayerMetadata(
-        key=TurboQuantTensorMetadata(default_high),
-        value=TurboQuantTensorMetadata(default_high),
+        key=TurboQuantTensorMetadata(key_high),
+        value=TurboQuantTensorMetadata(value_high),
     )
     return TurboQuantMetadata(
         recipe=recipe,

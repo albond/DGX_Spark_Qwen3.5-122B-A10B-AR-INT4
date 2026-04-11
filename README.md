@@ -453,17 +453,74 @@ We also developed and benchmarked a **custom CUDA fused kernel** that computes a
 - The current INT4 quantization (Intel AutoRound) was calibrated for standard context lengths. For deeper contexts (>256K), a custom AutoRound calibration would be needed.
 - The 1.4M token KV cache theoretically supports ~1M context, but model quality beyond 256K is unverified.
 
+### TurboQuant Recipes
+
+The `generate_tq_metadata.py` script supports multiple recipes. Choose based on your trade-off between memory, speed, and quality:
+
+| Recipe | K Storage | V Storage | Memory vs fp16 | Outlier Dims | Best For |
+|--------|-----------|-----------|----------------|--------------|----------|
+| `turboquant35` | TQ35 | TQ35 | 4× (128B/head) | 50% K+V same | Default, balanced |
+| `turboquant25` | TQ25 | TQ25 | 5× (108B/head) | 25% K+V same | Maximum compression |
+| `turboquant_asym` | TQ35 | TQ35 | 4× (128B/head) | 50% K≠V disjoint | Better needle retrieval |
+| `turboquant_q8k_tq35v` | int8 | TQ35 | ~2× (258B/head) | K=full, V=50% | Best quality |
+| `turboquant_q8k_tq25v` | int8 | TQ25 | ~2× (258B/head) | K=full, V=25% | Quality + V compression |
+
+**Recipe details:**
+
+- **`turboquant35`** (default): Symmetric 3.5-bit encoding. First 50% of dimensions are high-precision outliers for both K and V. Best balance of compression and quality.
+
+- **`turboquant25`**: More aggressive 2.5-bit encoding. Only 25% of dimensions are high-precision outliers. Higher compression ratio but more reconstruction error.
+
+- **`turboquant_asym`** (Asymmetric): Same storage as TQ35 (128B/head), but K uses the first 50% of dimensions while V uses the last 50%. This disjoint selection decorrelates K and V index sets, improving reconstruction quality for long-context needle-in-haystack tasks without extra memory cost.
+
+- **`turboquant_q8k_tq35v`** (True Asymmetric): K stored as int8 + fp16 scale (258 bytes/head), V stored as TQ35. ~2× memory overhead vs fp16 (vs 4× for symmetric TQ). K's full int8 precision preserves attention score quality, while V's TQ compression reduces the overall footprint. Recovers needle-in-haystack quality to 3/3 at 256K context (vs 0/3 with symmetric TQ35).
+
+- **`turboquant_q8k_tq25v`**: Same as above but V uses TQ25 (25% outlier dims). Same memory as q8k-tq35v, more aggressive V compression.
+
 ### Build & Run (TQ variant)
 
 ```bash
-# 1. Generate TQ metadata (one-time, places turboquant_kv.json in model dir)
-python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8
+# Step 1: Generate TQ metadata for each recipe you want to use.
+# Each recipe produces its own metadata file — they are NOT interchangeable.
+# --kv-cache-dtype at runtime must match the recipe used here.
 
-# 2. Build TQ image
+# TQ35 — default, balanced (4x memory reduction)
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json
+
+# TQ25 — maximum compression (5x memory reduction, lower quality)
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant25 \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json
+
+# turboquant_asym — same memory as TQ35, better long-context needle retrieval
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant_asym \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json
+
+# turboquant_q8k_tq35v — K=int8, V=TQ35 (best quality, ~2x memory)
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant_q8k_tq35v \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json
+
+# turboquant_q8k_tq25v — K=int8, V=TQ25 (quality + more V compression, ~2x memory)
+python patches/04-turboquant/generate_tq_metadata.py \
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --recipe turboquant_q8k_tq25v \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json
+
+# Step 2: Build TQ image
 docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
 
-# 3. Run
+# Step 3: Run — --kv-cache-dtype must match the recipe used in Step 1.
+# Each recipe has its own metadata file; using the wrong file causes a startup error.
+# TurboQuant auto-selects TRITON_ATTN backend regardless of other flags.
+
+# TQ35 (default)
 docker run -d --name vllm-qwen35-tq \
   --gpus all --net=host -v ~/models:/models \
   vllm-qwen35-v2-tq \
@@ -472,18 +529,72 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant35 --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# TQ25 (maximum compression)
+docker run -d --name vllm-qwen35-tq \
+  --gpus all --net=host -v ~/models:/models \
+  vllm-qwen35-v2-tq \
+  serve /models/qwen35-122b-hybrid-int4fp8 \
+  --served-model-name qwen --port 8000 \
+  --max-model-len 262144 --gpu-memory-utilization 0.90 \
+  --reasoning-parser qwen3 \
+  --kv-cache-dtype turboquant25 --enable-turboquant \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# turboquant_asym (disjoint K/V outlier dims)
+docker run -d --name vllm-qwen35-tq \
+  --gpus all --net=host -v ~/models:/models \
+  vllm-qwen35-v2-tq \
+  serve /models/qwen35-122b-hybrid-int4fp8 \
+  --served-model-name qwen --port 8000 \
+  --max-model-len 262144 --gpu-memory-utilization 0.90 \
+  --reasoning-parser qwen3 \
+  --kv-cache-dtype turboquant_asym --enable-turboquant \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# turboquant_q8k_tq35v (K=int8, V=TQ35 — best quality)
+docker run -d --name vllm-qwen35-tq \
+  --gpus all --net=host -v ~/models:/models \
+  vllm-qwen35-v2-tq \
+  serve /models/qwen35-122b-hybrid-int4fp8 \
+  --served-model-name qwen --port 8000 \
+  --max-model-len 262144 --gpu-memory-utilization 0.90 \
+  --reasoning-parser qwen3 \
+  --kv-cache-dtype turboquant_q8k_tq35v --enable-turboquant \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+
+# turboquant_q8k_tq25v (K=int8, V=TQ25 — quality + more V compression)
+docker run -d --name vllm-qwen35-tq \
+  --gpus all --net=host -v ~/models:/models \
+  vllm-qwen35-v2-tq \
+  serve /models/qwen35-122b-hybrid-int4fp8 \
+  --served-model-name qwen --port 8000 \
+  --max-model-len 262144 --gpu-memory-utilization 0.90 \
+  --reasoning-parser qwen3 \
+  --kv-cache-dtype turboquant_q8k_tq25v --enable-turboquant \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 ```
 
 > **First launch is slow (~15-20 min vs ~10 min for v2).** TQ patches modify vLLM internals at startup, and the Triton decode kernels are JIT-compiled on first run. Subsequent launches with cached Triton kernels are faster.
 
+> **Important:** `--kv-cache-dtype` must match the recipe embedded in the metadata file. Each recipe produces its own file (e.g. `turboquant_kv_q8k_tq35v.json` vs `turboquant_kv_q8k_tq25v.json`). Passing the wrong file causes a `ValueError` at startup.
+
+> **Attention Backend:** TurboQuant automatically uses `TRITON_ATTN`. The selector switches to TRITON_ATTN whenever any `turboquant*` dtype is detected — do not pass `--attention-backend FLASHINFER` with TurboQuant, it will fail.
+
 ### TQ Benchmarks
 
-| Config | tok/s | KV Cache | Concurrent @ 256K |
-|---|---|---|---|
-| v2 (standard) | **51** | 355K | 1 |
-| v2-tq | 39 (-22%) | 1.4M | 5 |
+| Config | tok/s | KV Cache | Concurrent @ 256K | Memory/head | Notes |
+|---|---|---|---|---|---|
+| v2 (standard) | **51** | 355K | 1 | 512B (fp16) | Baseline |
+| v2-tq (TQ35) | 39 (-22%) | 1.4M | 5 | 128B | Best memory efficiency |
+| v2-tq-asym | ~39 | 1.4M | 5 | 128B | Better long-context retrieval |
+| v2-tq-q8k-tq35v | ~35 (-31%) | ~700K | ~3 | 258B | Best quality, 2× memory |
 
 ---
 
