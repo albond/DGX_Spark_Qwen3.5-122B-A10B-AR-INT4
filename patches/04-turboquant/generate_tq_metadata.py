@@ -110,6 +110,11 @@ turboquant_q8k_tq25v Like turboquant_q8k_tq35v but with TQ25 for V (more compres
         choices=VALID_RECIPES,
         help="TurboQuant recipe (default: turboquant35)",
     )
+    parser.add_argument(
+        "--output-path",
+        default=None,
+        help="Output path for metadata JSON (default: <model-dir>/turboquant_kv.json)",
+    )
     args = parser.parse_args()
 
     model_dir = Path(args.model_dir)
@@ -161,7 +166,7 @@ turboquant_q8k_tq25v Like turboquant_q8k_tq35v but with TQ25 for V (more compres
         "layers": layers,
     }
 
-    output_path = model_dir / "turboquant_kv.json"
+    output_path = Path(args.output_path) if args.output_path else model_dir / "turboquant_kv.json"
     with open(output_path, "w") as f:
         json.dump(metadata, f, indent=2)
 

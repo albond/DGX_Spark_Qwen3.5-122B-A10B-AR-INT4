@@ -480,37 +480,44 @@ The `generate_tq_metadata.py` script supports multiple recipes. Choose based on 
 ### Build & Run (TQ variant)
 
 ```bash
-# Step 1: Generate TQ metadata (one-time, writes turboquant_kv.json to model dir)
-# Choose ONE recipe — must match --kv-cache-dtype used at runtime
+# Step 1: Generate TQ metadata for each recipe you want to use.
+# Each recipe produces its own metadata file — they are NOT interchangeable.
+# --kv-cache-dtype at runtime must match the recipe used here.
 
 # TQ35 — default, balanced (4x memory reduction)
 python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json
 
 # TQ25 — maximum compression (5x memory reduction, lower quality)
 python patches/04-turboquant/generate_tq_metadata.py \
     --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant25
+    --recipe turboquant25 \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json
 
 # turboquant_asym — same memory as TQ35, better long-context needle retrieval
 python patches/04-turboquant/generate_tq_metadata.py \
     --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_asym
+    --recipe turboquant_asym \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json
 
 # turboquant_q8k_tq35v — K=int8, V=TQ35 (best quality, ~2x memory)
 python patches/04-turboquant/generate_tq_metadata.py \
     --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_q8k_tq35v
+    --recipe turboquant_q8k_tq35v \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json
 
 # turboquant_q8k_tq25v — K=int8, V=TQ25 (quality + more V compression, ~2x memory)
 python patches/04-turboquant/generate_tq_metadata.py \
     --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_q8k_tq25v
+    --recipe turboquant_q8k_tq25v \
+    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json
 
 # Step 2: Build TQ image
 docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
 
-# Step 3: Run — set --kv-cache-dtype to match the recipe from Step 1
+# Step 3: Run — --kv-cache-dtype must match the recipe used in Step 1.
+# Each recipe has its own metadata file; using the wrong file causes a startup error.
 # TurboQuant auto-selects TRITON_ATTN backend regardless of other flags.
 
 # TQ35 (default)
@@ -522,7 +529,7 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant35 --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
 # TQ25 (maximum compression)
@@ -534,7 +541,7 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant25 --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
 # turboquant_asym (disjoint K/V outlier dims)
@@ -546,7 +553,7 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant_asym --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
 # turboquant_q8k_tq35v (K=int8, V=TQ35 — best quality)
@@ -558,7 +565,7 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant_q8k_tq35v --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
 # turboquant_q8k_tq25v (K=int8, V=TQ25 — quality + more V compression)
@@ -570,13 +577,13 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant_q8k_tq25v --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 ```
 
 > **First launch is slow (~15-20 min vs ~10 min for v2).** TQ patches modify vLLM internals at startup, and the Triton decode kernels are JIT-compiled on first run. Subsequent launches with cached Triton kernels are faster.
 
-> **Important:** The `--kv-cache-dtype` must match the recipe used when generating metadata. Mismatched recipes will cause runtime errors or degraded quality.
+> **Important:** `--kv-cache-dtype` must match the recipe embedded in the metadata file. Each recipe produces its own file (e.g. `turboquant_kv_q8k_tq35v.json` vs `turboquant_kv_q8k_tq25v.json`). Passing the wrong file causes a `ValueError` at startup.
 
 > **Attention Backend:** TurboQuant automatically uses `TRITON_ATTN`. The selector switches to TRITON_ATTN whenever any `turboquant*` dtype is detected — do not pass `--attention-backend FLASHINFER` with TurboQuant, it will fail.
 
