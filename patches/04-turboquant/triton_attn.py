@@ -44,6 +44,7 @@ from vllm.v1.attention.ops.triton_turboquant_kv_update import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     TurboQuantLayout,
+    _next_pow2,
     dequantize_turboquant_vectors,
     get_q8k_packed_bytes,
     get_turboquant_base_dtype,
@@ -390,8 +391,13 @@ class TritonAttentionBackend(AttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         if is_turboquant_kv_cache(cache_dtype_str):
-            bits = get_turboquant_bits(cache_dtype_str)
-            packed_dim = get_turboquant_packed_dim(head_size, bits)
+            if is_turboquant_q8k(cache_dtype_str):
+                # Q8K: K slot = head_size + 2 bytes; align to next power-of-2
+                # for hybrid model page-size compatibility (same as TQ35→128).
+                packed_dim = _next_pow2(get_q8k_packed_bytes(head_size))
+            else:
+                bits = get_turboquant_bits(cache_dtype_str)
+                packed_dim = get_turboquant_packed_dim(head_size, bits)
             return (num_blocks, 2, block_size, num_kv_heads, packed_dim)
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
