@@ -354,6 +354,9 @@ class TritonAttentionBackend(AttentionBackend):
         "fp8_e5m2",
         "turboquant25",
         "turboquant35",
+        "turboquant_asym",
+        "turboquant_q8k_tq35v",
+        "turboquant_q8k_tq25v",
     ]
 
     @staticmethod

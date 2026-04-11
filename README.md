@@ -499,6 +499,7 @@ python patches/04-turboquant/generate_tq_metadata.py \
 docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
 
 # 3. Run (match --kv-cache-dtype to the recipe used for metadata generation)
+# NOTE: --attention-backend TRITON_ATTN is auto-selected when using TurboQuant
 docker run -d --name vllm-qwen35-tq \
   --gpus all --net=host -v ~/models:/models \
   vllm-qwen35-v2-tq \
@@ -514,6 +515,8 @@ docker run -d --name vllm-qwen35-tq \
 > **First launch is slow (~15-20 min vs ~10 min for v2).** TQ patches modify vLLM internals at startup, and the Triton decode kernels are JIT-compiled on first run. Subsequent launches with cached Triton kernels are faster.
 
 > **Important:** The `--kv-cache-dtype` must match the recipe used when generating metadata. Mismatched recipes will cause runtime errors or degraded quality.
+
+> **Attention Backend:** TurboQuant requires `TRITON_ATTN` backend. The selector auto-switches to TRITON_ATTN when any `turboquant*` dtype is detected. Do NOT use `--attention-backend FLASHINFER` with TurboQuant — it will fail with "kv_cache_dtype not supported" errors.
 
 ### TQ Benchmarks
 
