@@ -1245,6 +1245,15 @@ class TritonAttentionImpl(AttentionImpl):
         block_size = key_cache.shape[1]  # key_cache: [blocks, block_size, H, packed_dim]
         block_idx = (slot_mapping // block_size).long()
         block_off = (slot_mapping % block_size).long()
+        # Pad packed_k to the cache slot width (cache is allocated next-pow2 aligned,
+        # e.g. packed_dim=512 for head_size=256, but packed_k has 2+256=258 bytes).
+        packed_dim = key_cache.shape[-1]
+        q8k_bytes = packed_k.shape[-1]
+        if q8k_bytes < packed_dim:
+            packed_k = torch.cat(
+                [packed_k, packed_k.new_zeros(*packed_k.shape[:-1], packed_dim - q8k_bytes)],
+                dim=-1,
+            )
         key_cache[block_idx, block_off] = packed_k  # scatter [T, H, packed_dim]
 
         # ── Encode V as TQ and scatter into value_cache pages ──
