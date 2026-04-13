@@ -155,6 +155,16 @@ git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
 sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
 sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
 
+# Pin PyTorch nightly versions in BOTH stages. The upstream Dockerfile runs
+# `uv pip install torch torchvision torchaudio triton ...` twice (builder
+# stage ~L50 and runner stage ~L311). Without a pin, those two invocations
+# resolve independently and can pull two different nightlies on the same
+# calendar day — which bakes an ABI mismatch into the image. Symptom:
+# `ImportError: undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv`
+# at startup (PyTorch changed the signature of at::cuda::getCurrentCUDABlasHandle
+# between nightlies, so vllm/_C.abi3.so and libtorch_cuda.so disagree).
+sed -i 's|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130|g' Dockerfile
+
 ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 cd ..
 ```
@@ -165,9 +175,13 @@ This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121).
 >
 > **Why `--tf5` and `--vllm-ref v0.19.0`:** our image was built with `transformers_5: true` and `vllm_ref: v0.19.0` (read from `/workspace/build-metadata.yaml` inside the image). The script's defaults are different, and an image built with defaults will not be binary-compatible with our patches.
 >
-> **Why the two `sed` commands:** the upstream Dockerfile at `49d6d9f` has two hardcoded `RUN curl ... .diff | git apply` blocks that pull vLLM PRs 35568 and 38919 live from GitHub. Both PRs target bugs in `main`, not in `v0.19.0`, and both were force-pushed after our original 2026-04-04 build, so their current diffs no longer apply to `v0.19.0` (they reference files moved under `csrc/libtorch_stable/` which didn't exist yet at that path in `v0.19.0`). We verified via MD5 comparison that `marlin_utils.py` inside our reference image is byte-identical to pristine `v0.19.0` — i.e. PR 35568 was never actually applied to our image in the first place. Removing the two blocks reproduces the original build.
+> **Why the two "TEMPORARY PATCH" `sed` commands:** the upstream Dockerfile at `49d6d9f` has two hardcoded `RUN curl ... .diff | git apply` blocks that pull vLLM PRs 35568 and 38919 live from GitHub. Both PRs target bugs in `main`, not in `v0.19.0`, and both were force-pushed after our original 2026-04-04 build, so their current diffs no longer apply to `v0.19.0` (they reference files moved under `csrc/libtorch_stable/` which didn't exist yet at that path in `v0.19.0`). We verified via MD5 comparison that `marlin_utils.py` inside our reference image is byte-identical to pristine `v0.19.0` — i.e. PR 35568 was never actually applied to our image in the first place. Removing the two blocks reproduces the original build.
+>
+> **Why the torch pin `sed` command:** the upstream Dockerfile runs `uv pip install torch torchvision torchaudio triton ...` twice — once in the `vllm-builder` stage (where vLLM's C extension `_C.abi3.so` is compiled against whatever torch nightly happens to resolve) and again in the runner stage (where the final torch that ships in the image is installed). PyTorch nightlies can change function signatures between consecutive days — a real observed example is `at::cuda::getCurrentCUDABlasHandle` gaining a `bool` parameter, changing the mangled symbol from `...Ev` to `...Eb`. When the two stages land on different nightlies, the final image imports vLLM against a torch that no longer exports the symbol vLLM was linked against, and the server dies at startup with `ImportError: undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv`. Pinning both invocations to the same nightly date eliminates the drift. `triton` is intentionally left unpinned — it's a JIT compiler with no C++ ABI coupling to `libtorch`, and the nightly index uses git-hash versions for it.
+>
+> **If the pinned wheels are gone:** PyTorch nightly wheels have a finite retention (roughly 2 weeks for torchvision/torchaudio, ~35 days for torch). If `2.12.0.dev20260408+cu130` is no longer on `https://download.pytorch.org/whl/nightly/cu130/`, change the date in the sed command to any newer available nightly — the critical requirement is that **all three packages use the same date** so both stages get a consistent torch ABI. Verify with `curl -s https://download.pytorch.org/whl/nightly/cu130/torch/ | grep <date>` before rebuilding.
 
-> **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`, eugr/spark-vllm-docker commit `49d6d9f`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
+> **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`, eugr/spark-vllm-docker commit `49d6d9f`) against **PyTorch `2.12.0.dev20260408+cu130`** (matching `torchvision 0.27.0.dev20260408+cu130` and `torchaudio 2.11.0.dev20260408+cu130`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
 
 ### Step 4: Build v2 image
 
@@ -235,7 +249,6 @@ docker run -it --name vllm-qwen35 \
   --load-format fastsafetensors \
   --attention-backend FLASHINFER \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
-  --enable-prefix-caching \
   --enable-chunked-prefill \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
@@ -263,7 +276,7 @@ Notable flags in this example:
 
 > **Adapt to your needs.** These are suggestions, not requirements. The only flags critical for this project's optimizations are `--attention-backend FLASHINFER` and `--speculative-config`. Everything else depends on your use case. See [vLLM documentation](https://docs.vllm.ai/) for the full flag reference.
 >
-> **Note on `--enable-prefix-caching`:** This may conflict with DeltaNet hybrid attention on some workloads (see Troubleshooting). Test with your specific prompts.
+> **Note:** `--enable-prefix-caching` is intentionally omitted — it crashes on Qwen3.5 due to DeltaNet hybrid attention (see Troubleshooting).
 
 **Tool-call parser options:** vLLM ships two parsers for Qwen models. Pick the one that matches your model:
 
@@ -307,14 +320,18 @@ These exact versions were used for all benchmarks. Mismatched versions may cause
 | Component | Version |
 |---|---|
 | **vLLM** | `0.19.1.dev0+g2a69949bd.d20260404` (commit `2a69949bd`) |
-| **PyTorch** | `2.12.0.dev20260403+cu130` |
+| **PyTorch** | `2.12.0.dev20260408+cu130` |
+| **torchvision** | `0.27.0.dev20260408+cu130` |
+| **torchaudio** | `2.11.0.dev20260408+cu130` |
 | **CUDA Toolkit** | 13.2 (V13.2.51) |
 | **CUDA (torch)** | 13.0 |
 | **FlashInfer** | 0.6.7 |
-| **Triton** | 3.7.0 |
+| **Triton** | `3.7.0+git282c8251` |
 | **Python** | 3.12.3 |
 | **OS** | Ubuntu 24.04.4 LTS (aarch64) |
 | **Build flags** | `TORCH_CUDA_ARCH_LIST=12.1a` `FLASHINFER_CUDA_ARCH_LIST=12.1a` |
+
+> **Why all three torch packages are pinned to the same date:** PyTorch, torchvision, and torchaudio are released together every night but are separate packages on the nightly index. The eugr base image installs all three via `uv pip install torch torchvision torchaudio triton ...` in two different build stages. Without an explicit pin, the two invocations can land on different nightlies (e.g., builder pulls `dev20260411` while runner pulls `dev20260412`), which bakes an ABI mismatch into the final image — the vLLM C extension ends up linked against a torch that no longer exports the symbols it was compiled against. `install.sh` enforces the pin automatically; a manual build must reproduce the `sed` command in Step 3.
 
 ## Prerequisites
 
@@ -332,10 +349,11 @@ cd spark-vllm-docker
 git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
 sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
 sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
+sed -i 's|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130|g' Dockerfile
 ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 ```
 
-Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The two `sed` commands strip out upstream "TEMPORARY PATCH" RUN blocks that curl-fetch vLLM PRs 35568 and 38919 from live GitHub URLs; those PRs target main-branch bugs that don't apply to `v0.19.0`, and both were force-pushed after 2026-04-04. The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
+Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The first two `sed` commands strip upstream "TEMPORARY PATCH" RUN blocks that curl-fetch vLLM PRs 35568 and 38919 from live GitHub URLs; those PRs target main-branch bugs that don't apply to `v0.19.0`, and both were force-pushed after 2026-04-04. The third `sed` pins `torch`, `torchvision`, and `torchaudio` in both `pip install` stages of the upstream Dockerfile to the exact nightly date baked into our reference image — without this pin, the builder and runner stages can resolve to different nightlies and produce an ABI mismatch between `vllm/_C.abi3.so` and `libtorch_cuda.so` (symptom: `undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv` at startup). The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
 
 If building manually, the critical environment variables are:
 

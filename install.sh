@@ -37,6 +37,19 @@ SPARK_VLLM_DIR="${PROJECT_DIR}/spark-vllm-docker"
 HYBRID_DIR="${HOME}/models/qwen35-122b-hybrid-int4fp8"
 SPARK_VLLM_PIN="49d6d9fefd7cd05e63af8b28e4b514e9d30d249f"
 
+# Frozen PyTorch nightly versions — these MUST be identical to what's inside
+# our reference vllm-qwen35-v2:latest image. Upstream eugr/spark-vllm-docker
+# does two separate `uv pip install torch ...` calls (builder stage ~line 50
+# and runner stage ~line 311). Without pins, those two calls can pull two
+# different nightlies on the same day, producing an ABI mismatch between
+# vllm/_C.abi3.so and libtorch_cuda.so. The observed failure mode is a fatal
+# ImportError at startup: "undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv".
+# Pinning both stages to the same date eliminates the drift.
+TORCH_NIGHTLY_DATE="20260408"
+TORCH_VERSION="2.12.0.dev${TORCH_NIGHTLY_DATE}+cu130"
+TORCHVISION_VERSION="0.27.0.dev${TORCH_NIGHTLY_DATE}+cu130"
+TORCHAUDIO_VERSION="2.11.0.dev${TORCH_NIGHTLY_DATE}+cu130"
+
 # ── Flags ─────────────────────────────────────────────────────────────────────
 NO_CACHE=0
 LAUNCH_MODE="prompt"   # prompt | yes | no
@@ -320,6 +333,29 @@ else
     if grep -qE 'pr35568|pr38919' "${SPARK_VLLM_DIR}/Dockerfile"; then
         abort "sed didn't strip the PR blocks cleanly — upstream Dockerfile may have changed shape."
     fi
+
+    # Pin PyTorch nightly versions in BOTH stages of the upstream Dockerfile.
+    # Upstream has two identical `uv pip install torch torchvision torchaudio
+    # triton --index-url ...` lines (builder stage ~L50, runner stage ~L311).
+    # Without a pin, those two invocations resolve independently and can pull
+    # different nightlies on the same calendar day — which bakes an ABI
+    # mismatch into the image (see the TORCH_NIGHTLY_DATE comment up top).
+    # We pin torch/torchvision/torchaudio to a single frozen date; triton is
+    # intentionally left unpinned because it's a JIT compiler with no ABI
+    # coupling to libtorch and the nightly index uses git-hash versions.
+    sed -i "s|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} triton --index-url https://download.pytorch.org/whl/nightly/cu130|g" \
+        "${SPARK_VLLM_DIR}/Dockerfile"
+
+    # Sanity: the pinned version must now appear at least twice (one per stage)
+    # and the unpinned form must be gone entirely.
+    pinned_count=$(grep -c "torch==${TORCH_VERSION}" "${SPARK_VLLM_DIR}/Dockerfile" || true)
+    if [ "${pinned_count}" -lt 2 ]; then
+        abort "torch version pin didn't land in both stages (found ${pinned_count} occurrences, expected 2). Upstream Dockerfile may have changed shape."
+    fi
+    if grep -qE 'uv pip install torch torchvision torchaudio triton --index-url' "${SPARK_VLLM_DIR}/Dockerfile"; then
+        abort "unpinned torch install line still present after sed — refusing to build, this would produce a broken image."
+    fi
+    note "pinned torch=${TORCH_VERSION} (and matching torchvision/torchaudio) in both stages"
 
     # Suppress deprecation warning spam from CUTLASS×CUDA13: when nvcc compiles
     # vllm-flash-attn against CUTLASS, the host gcc emits hundreds of
