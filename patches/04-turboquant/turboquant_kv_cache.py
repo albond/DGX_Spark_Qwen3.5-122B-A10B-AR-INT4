@@ -12,14 +12,42 @@ import torch
 TURBOQUANT_KV_CACHE_BITS = {
     "turboquant25": 2.5,
     "turboquant35": 3.5,
+    # Asymmetric: K and V both stored as TQ35 but with independently calibrated
+    # outlier-dimension selections. K defaults to first-half dims, V to last-half
+    # dims, maximising decorrelation between the two index sets.
+    # Underlying storage format is identical to turboquant35 (same packed_dim,
+    # same bit-widths, same transform matrices) — no kernel changes required.
+    "turboquant_asym": 3.5,
+    # True asymmetric: K stored as int8 (Q8) + fp16 scale, V stored as TQ.
+    # Bits reflect the V-side TQ recipe; K uses fixed 8-bit storage.
+    # packed_dim = head_size + 2 (Q8 format dominates, V zero-pads to fit).
+    "turboquant_q8k_tq35v": 3.5,  # V=TQ35, conservative
+    "turboquant_q8k_tq25v": 2.5,  # V=TQ25, more V compression
 }
 TURBOQUANT_OUTLIER_RATIOS = {
     "turboquant25": 0.25,
     "turboquant35": 0.50,
+    "turboquant_asym": 0.50,  # Same ratio as TQ35; differs only in index selection
 }
 TURBOQUANT_GROUP_BITS = {
     "turboquant25": (3, 2),
     "turboquant35": (4, 3),
+    "turboquant_asym": (4, 3),  # Same layout as TQ35
+}
+
+# Maps asymmetric meta-recipes to the underlying storage recipe used by kernels.
+# For soft-asym (turboquant_asym): same TQ35 kernels, disjoint outlier dims.
+# For true-asym Q8K: resolves to the V-side TQ recipe for V encode/decode tables.
+TURBOQUANT_ASYM_BASE_RECIPE: dict[str, str] = {
+    "turboquant_asym": "turboquant35",
+    "turboquant_q8k_tq35v": "turboquant35",
+    "turboquant_q8k_tq25v": "turboquant25",
+}
+
+# Maps Q8K meta-recipes to the underlying V TQ storage recipe.
+TURBOQUANT_Q8K_DTYPES: dict[str, str] = {
+    "turboquant_q8k_tq35v": "turboquant35",
+    "turboquant_q8k_tq25v": "turboquant25",
 }
 TURBOQUANT_VECTOR_NORM_BYTES = 2
 TURBOQUANT_RESIDUAL_NORM_BYTES = 2
@@ -55,6 +83,47 @@ def is_turboquant_kv_cache(kv_cache_dtype: str) -> bool:
     return kv_cache_dtype in TURBOQUANT_KV_CACHE_BITS
 
 
+def is_turboquant_asym(kv_cache_dtype: str) -> bool:
+    """Return True for asymmetric TurboQuant recipes (separate K/V index sets)."""
+    return kv_cache_dtype in TURBOQUANT_ASYM_BASE_RECIPE
+
+
+def get_turboquant_base_dtype(kv_cache_dtype: str) -> str:
+    """Return the underlying storage recipe used by Triton kernels.
+
+    For symmetric recipes this is an identity.  For asymmetric meta-recipes
+    (e.g. "turboquant_asym") it returns the actual storage recipe that the
+    kernels were compiled against (e.g. "turboquant35").
+    For Q8K meta-recipes it returns the V-side TQ recipe.
+    """
+    return TURBOQUANT_ASYM_BASE_RECIPE.get(kv_cache_dtype, kv_cache_dtype)
+
+
+def is_turboquant_q8k(kv_cache_dtype: str) -> bool:
+    """Return True for Q8K recipes (K stored as int8, V stored as TurboQuant)."""
+    return kv_cache_dtype in TURBOQUANT_Q8K_DTYPES
+
+
+def get_turboquant_q8k_v_dtype(kv_cache_dtype: str) -> str:
+    """Return the V-side TQ recipe for a Q8K meta-recipe."""
+    return TURBOQUANT_Q8K_DTYPES[kv_cache_dtype]
+
+
+def get_q8k_packed_bytes(head_size: int) -> int:
+    """Return the per-head cache slot size for Q8K encoding.
+
+    Q8K packs each K head as: [scale_lo, scale_hi, val[0]..val[D-1]]
+    where scale is fp16 (2 bytes) and values are int8 stored as uint8.
+    Total: head_size + 2 bytes per head.
+
+    Both K and V cache slots use this size so that kv_cache.unbind(1)
+    yields [num_blocks, block_size, num_kv_heads, head_size+2] for both
+    K and V.  The V slot writes its TQ payload into the first N bytes and
+    leaves the remainder zero-padded.
+    """
+    return head_size + 2
+
+
 def get_turboquant_bits(kv_cache_dtype: str) -> float:
     try:
         return TURBOQUANT_KV_CACHE_BITS[kv_cache_dtype]
@@ -68,7 +137,9 @@ def _canonical_turboquant_dtype(bits_or_dtype: float | int | str) -> str:
     if isinstance(bits_or_dtype, str):
         if not is_turboquant_kv_cache(bits_or_dtype):
             raise ValueError(f"Unsupported TurboQuant KV cache dtype: {bits_or_dtype}")
-        return bits_or_dtype
+        # Resolve asym meta-recipes to their underlying storage recipe so that
+        # layout / packed-dim computations use the correct bit-widths.
+        return get_turboquant_base_dtype(bits_or_dtype)
 
     bits = float(bits_or_dtype)
     if bits == 2.5:
@@ -829,3 +900,63 @@ def dequantize_turboquant_vectors(
         group_indices=group_indices,
         kv_head_for_query_head=kv_head_for_query_head,
     )
+
+
+# ── Q8K (int8 Key) encode / decode ──────────────────────────────────────────
+
+
+def pack_q8k_to_uint8(key: torch.Tensor, head_size: int) -> torch.Tensor:
+    """Encode key vectors as Q8 (int8 + fp16 scale) packed into uint8.
+
+    Per-head format:
+        [scale_lo, scale_hi, val[0], val[1], ..., val[head_size-1]]
+    where scale = abs(key_head).max() / 127.0 stored as fp16 little-endian.
+
+    Args:
+        key: float tensor of shape [T, H, D].
+        head_size: number of dimensions D (must equal key.shape[-1]).
+
+    Returns:
+        uint8 tensor of shape [T, H, 2 + head_size].
+    """
+    key_f32 = key.to(torch.float32)
+    # Per-head absmax scale; clamp_min avoids division by zero.
+    scale = key_f32.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0  # [T,H,1]
+    values_int8 = (key_f32 / scale).clamp(-128, 127).round().to(torch.int8)  # [T,H,D]
+
+    # Encode scale as 2 uint8 bytes (fp16, little-endian).
+    scale_fp16 = scale.squeeze(-1).to(torch.float16).contiguous()  # [T, H]
+    scale_bytes = scale_fp16.view(torch.uint8).reshape(*scale_fp16.shape, 2)  # [T, H, 2]
+
+    # View int8 values as uint8 (same bit pattern).
+    values_u8 = values_int8.contiguous().view(torch.uint8)  # [T, H, D]
+
+    return torch.cat([scale_bytes, values_u8], dim=-1)  # [T, H, 2+D]
+
+
+def unpack_q8k_from_cache(cache_slot: torch.Tensor, head_size: int) -> torch.Tensor:
+    """Decode Q8-encoded key vectors back to fp16.
+
+    Args:
+        cache_slot: uint8 tensor of shape [..., H, packed_dim] where
+            packed_dim >= head_size + 2.  The first 2 bytes per head are the
+            fp16 scale and the next head_size bytes are int8 values.
+        head_size: number of key dimensions to decode.
+
+    Returns:
+        fp16 tensor of shape [..., H, head_size].
+    """
+    # Extract scale bytes and quantized values.
+    scale_bytes = cache_slot[..., :2].contiguous()   # [..., H, 2]
+    values_u8 = cache_slot[..., 2:2 + head_size].contiguous()  # [..., H, D]
+
+    # Recover fp16 scale: 2 uint8 bytes → 1 float16.
+    orig_shape = scale_bytes.shape  # [..., H, 2]
+    scale_fp16 = (
+        scale_bytes.reshape(-1, 2).view(torch.float16).reshape(orig_shape[:-1])
+    )  # [..., H]
+    scale_f32 = scale_fp16.to(torch.float32).unsqueeze(-1)  # [..., H, 1]
+
+    # Dequantize: int8 values × scale → fp16.
+    values_f32 = values_u8.view(torch.int8).to(torch.float32) * scale_f32  # [..., H, D]
+    return values_f32.to(torch.float16)
