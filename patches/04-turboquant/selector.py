@@ -77,6 +77,10 @@ def get_attn_backend(
             raise ValueError(
                 "TurboQuant KV cache requires --enable-turboquant."
             )
+        # TurboQuant requires TRITON_ATTN backend - other backends don't support
+        # custom kv_cache_dtypes. Auto-switch to TRITON_ATTN if user specified
+        # a different backend.
+        backend = "TRITON_ATTN"
     if cache_config is not None and cache_config.user_specified_block_size:
         block_size = cache_config.block_size
     else:

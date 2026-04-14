@@ -234,12 +234,16 @@ if "turboquant" not in content:
     if '    "fp8_ds_mla",\n]' in content:
         content = content.replace(
             '    "fp8_ds_mla",\n]',
-            '    "fp8_ds_mla",\n    "turboquant25",\n    "turboquant35",\n]',
+            '    "fp8_ds_mla",\n'
+            '    "turboquant25",\n    "turboquant35",\n    "turboquant_asym",\n'
+            '    "turboquant_q8k_tq35v",\n    "turboquant_q8k_tq25v",\n]',
         )
     elif '    "fp8_per_token_head",\n]' in content:
         content = content.replace(
             '    "fp8_per_token_head",\n]',
-            '    "fp8_per_token_head",\n    "turboquant25",\n    "turboquant35",\n]',
+            '    "fp8_per_token_head",\n'
+            '    "turboquant25",\n    "turboquant35",\n    "turboquant_asym",\n'
+            '    "turboquant_q8k_tq35v",\n    "turboquant_q8k_tq25v",\n]',
         )
     else:
         _errors.append("Could not find CacheDType closing pattern in cache.py")
@@ -260,10 +264,22 @@ if "turboquant" not in content:
         content = content.replace(
             'return cache_dtype\n\n    @model_validator',
             '        elif cache_dtype.startswith("turboquant"):\n'
-            '            logger.warning(\n'
+            '            _tq_msg = (\n'
             '                "Using TurboQuant KV cache with the Triton attention backend "\n'
+            '                "(requires NVIDIA GB10 / SM121). "\n'
+            '                "Asymmetric mode (turboquant_asym): K and V use disjoint "\n'
+            '                "outlier-dim selections for improved quality."\n'
+            '                if cache_dtype == "turboquant_asym"\n'
+            '                else "Using TurboQuant KV cache (K=Q8 int8, V=TQ35) with the Triton "\n'
+            '                "attention backend (requires NVIDIA GB10 / SM121)."\n'
+            '                if cache_dtype == "turboquant_q8k_tq35v"\n'
+            '                else "Using TurboQuant KV cache (K=Q8 int8, V=TQ25) with the Triton "\n'
+            '                "attention backend (requires NVIDIA GB10 / SM121)."\n'
+            '                if cache_dtype == "turboquant_q8k_tq25v"\n'
+            '                else "Using TurboQuant KV cache with the Triton attention backend "\n'
             '                "(requires NVIDIA GB10 / SM121)."\n'
             '            )\n'
+            '            logger.warning(_tq_msg)\n'
             '        return cache_dtype\n\n'
             '    @model_validator(mode="after")\n'
             '    def _validate_turboquant(self) -> "CacheConfig":\n'
@@ -341,6 +357,9 @@ if "turboquant" not in content:
         "}\n\nTORCH_DTYPE_TO_NUMPY_DTYPE",
         '    "turboquant25": torch.uint8,\n'
         '    "turboquant35": torch.uint8,\n'
+        '    "turboquant_asym": torch.uint8,\n'
+        '    "turboquant_q8k_tq35v": torch.uint8,\n'
+        '    "turboquant_q8k_tq25v": torch.uint8,\n'
         "}\n\nTORCH_DTYPE_TO_NUMPY_DTYPE",
     )
     write(torch_path, content)
