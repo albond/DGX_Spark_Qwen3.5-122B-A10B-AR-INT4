@@ -391,7 +391,7 @@ if docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1; then
     step_skip "Step 4 — vllm-qwen35-v2:latest already exists (delete with 'docker rmi vllm-qwen35-v2' to rebuild, or pass --no-cache)"
 else
     step_begin "Step 4 — Building vllm-qwen35-v2 (final image)" \
-               "thin layer on top of vllm-sm121: copies hybrid INC patch, INT8 LM Head v2, entrypoint"
+               "thin layer on top of vllm-sm121: copies hybrid INC patch and bakes INT8 LM Head v2 patch"
     cd "${PROJECT_DIR}"
     docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
     docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1 \
@@ -621,7 +621,7 @@ poll_health_with_progress() {
                 pct=$(echo "$stage_marker" | grep -oE '[0-9]+%' | tail -1)
                 stage="Loading weights ${pct}"
                 ;;
-            *) stage="initializing (entrypoint, vLLM CLI)" ;;
+            *) stage="initializing (vLLM CLI)" ;;
         esac
 
         # Build progress bar (24 chars wide). Cap at 99% until health is OK.

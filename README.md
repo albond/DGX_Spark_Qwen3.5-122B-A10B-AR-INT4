@@ -595,7 +595,7 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 │   ├── 02-mtp-speculative/
 │   │   └── add-mtp-weights.py               # Register MTP weights in model index
 │   ├── 03-int8-lm-head/
-│   │   └── patch_int8_lmhead.py             # INT8 LM Head v2 (runtime patch)
+│   │   └── patch_int8_lmhead.py             # INT8 LM Head v2 (baked into image at build time)
 │   └── 04-turboquant/                       # Optional: TurboQuant KV cache
 │       ├── generate_tq_metadata.py           # Generate turboquant_kv.json
 │       ├── kv_cache_interface.py            # TQ-aware KV cache interface
@@ -614,10 +614,8 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 │           ├── lab_2_perf.py                # Performance benchmark
 │           └── lab_2_tq_fused_bench.py      # Full benchmark suite
 ├── docker/
-│   ├── Dockerfile.v2                        # Main: vLLM + hybrid + INT8 LM Head
-│   ├── Dockerfile.v2-tq                     # Optional: + TurboQuant
-│   ├── entrypoint-v2.sh                     # Applies INT8 LM Head patch
-│   └── entrypoint-v2-tq.sh                 # Applies INT8 LM Head + TQ patches
+│   ├── Dockerfile.v2                        # Main: vLLM + hybrid + INT8 LM Head (baked in)
+│   └── Dockerfile.v2-tq                     # Optional: + TurboQuant (baked in)
 └── configs/
     ├── launch-baseline.sh                   # 28.3 tok/s (reference)
     ├── launch-hybrid.sh                     # 30.8 tok/s (hybrid only)

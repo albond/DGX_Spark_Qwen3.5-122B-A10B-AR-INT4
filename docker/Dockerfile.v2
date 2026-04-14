@@ -31,12 +31,12 @@ FROM vllm-sm121:latest
 COPY patches/01-hybrid-int4-fp8/inc.py \
      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/inc.py
 
-# Patch 2: INT8 LM Head v2 (applied at runtime by entrypoint)
+# Patch 2: INT8 LM Head v2 — baked into the image at build time
+# (patch_int8_lmhead.py is a pure text transform of logits_processor.py;
+# running it here makes container startup go directly to `vllm serve`)
 COPY patches/03-int8-lm-head/patch_int8_lmhead.py /opt/patches/patch_int8_lmhead.py
+RUN python3 /opt/patches/patch_int8_lmhead.py \
+ && grep -q DGX_SPARK_INT8_LMHEAD_V2 /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/logits_processor.py
 
-# Entrypoint applies runtime patches, then starts vLLM
-COPY docker/entrypoint-v2.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh
-
-ENTRYPOINT ["/opt/entrypoint.sh"]
+ENTRYPOINT ["vllm"]
 CMD ["serve", "--help"]

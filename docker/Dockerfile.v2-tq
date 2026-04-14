@@ -29,10 +29,13 @@ FROM vllm-sm121:latest
 COPY patches/01-hybrid-int4-fp8/inc.py \
      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/inc.py
 
-# Patch 2: INT8 LM Head v2 (applied at runtime)
+# Patch 2: INT8 LM Head v2 — baked into the image at build time
 COPY patches/03-int8-lm-head/patch_int8_lmhead.py /opt/patches/patch_int8_lmhead.py
+RUN python3 /opt/patches/patch_int8_lmhead.py \
+ && grep -q DGX_SPARK_INT8_LMHEAD_V2 /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/logits_processor.py
 
-# Patch 3: TurboQuant (applied at runtime)
+# Patch 3: TurboQuant — baked into the image at build time
+# TQ patches are inert unless --kv-cache-dtype turboquantXX is passed at runtime.
 COPY patches/04-turboquant/patch_turboquant_v2.py /opt/patches/patch_turboquant.py
 COPY patches/04-turboquant/turboquant_kv_cache.py /opt/patches/tq_src/ops/turboquant_kv_cache.py
 COPY patches/04-turboquant/turboquant_metadata.py /opt/patches/tq_src/ops/turboquant_metadata.py
@@ -41,10 +44,7 @@ COPY patches/04-turboquant/triton_turboquant_kv_update.py /opt/patches/tq_src/op
 COPY patches/04-turboquant/selector.py /opt/patches/tq_src/selector.py
 COPY patches/04-turboquant/triton_attn.py /opt/patches/tq_src/backends/triton_attn.py
 COPY patches/04-turboquant/kv_cache_interface.py /opt/patches/tq_src/kv_cache_interface.py
+RUN python3 /opt/patches/patch_turboquant.py
 
-# Entrypoint applies all patches, then starts vLLM
-COPY docker/entrypoint-v2-tq.sh /opt/entrypoint.sh
-RUN chmod +x /opt/entrypoint.sh
-
-ENTRYPOINT ["/opt/entrypoint.sh"]
+ENTRYPOINT ["vllm"]
 CMD ["serve", "--help"]
