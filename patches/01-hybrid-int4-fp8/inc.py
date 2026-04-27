@@ -235,8 +235,14 @@ class INCConfig(QuantizationConfig):
                 hf_to_vllm_mapper.apply_list(list(self.fp8_layers))
             )
 
-    def maybe_update_config(self, model_name: str, revision: str | None = None):
-        """Detect FP8 layers in hybrid INT4+FP8 checkpoints."""
+    def maybe_update_config(self, model_name: str, hf_config=None, revision: str | None = None):
+        """Detect FP8 layers in hybrid INT4+FP8 checkpoints.
+
+        vLLM 0.20.x added `hf_config` kwarg between model_name and revision; we
+        accept and ignore it (not needed for our FP8 detection — we read directly
+        from safetensors metadata). Keeping this compatible with vLLM 0.19.x is
+        why `hf_config` defaults to None.
+        """
         metadata = get_safetensors_params_metadata(model_name, revision=revision)
         fp8_weights: dict[str, dict[str, Any]] = {}
         for param_name, info in metadata.items():
@@ -528,9 +534,15 @@ class INCConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg, user_quant
+        cls, hf_quant_cfg, user_quant, hf_config=None
     ) -> "QuantizationMethods | None":
-        """Override the `auto-round` method to `inc`."""
+        """Override the `auto-round` method to `inc`.
+
+        vLLM 0.20.x added `hf_config` kwarg to this signature; we accept
+        and ignore it (we already have everything we need from hf_quant_cfg).
+        Master's vLLM 0.19.1 used the old 2-arg form. Keep both compatible
+        by giving `hf_config` a default.
+        """
         is_auto_round_format = hf_quant_cfg.get("quant_method", None) == "auto-round"
         if is_auto_round_format:
             return cls.get_name()

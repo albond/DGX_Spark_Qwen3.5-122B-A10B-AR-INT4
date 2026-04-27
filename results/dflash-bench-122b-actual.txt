@@ -1,0 +1,104 @@
+DFlash-on-vLLM 0.20 + Hybrid INT4+FP8 + INT8 LM Head v2 — single DGX Spark (GB10/SM121)
+========================================================================================
+
+Date: 2026-04-27
+Image: vllm-qwen35-v2-dflash:latest (built from this branch's install.sh)
+Stack:
+  - vLLM 0.20.1.dev0+gb8160878f.d20260427.cu132 (v0.20.0 + PR #40898 cherry-pick)
+  - PyTorch 2.12.0.dev20260408+cu130
+  - SM121 native build (TORCH_CUDA_ARCH_LIST=12.1a)
+  - Patches: Hybrid INT4+FP8 inc.py replacement, INT8 LM Head v2
+Target: /models/qwen35-122b-hybrid-int4fp8 (Intel AutoRound INT4 with FP8 dense
+  shared-expert overlay from Qwen3.5-122B-A10B-FP8)
+Drafter: z-lab/Qwen3.5-122B-A10B-DFlash (~1 GB BF16, 5-layer EAGLE-style)
+Launch flags:
+  --max-model-len 32768 --max-num-batched-tokens 4096
+  --gpu-memory-utilization 0.85
+  --reasoning-parser qwen3 --attention-backend FLASH_ATTN
+  --speculative-config '{"method":"dflash","model":"...","num_speculative_tokens":<k>}'
+Benchmark: bench_qwen35.sh (5 prompt classes × 2 runs, T=0)
+  Q&A: 256-token max, "TCP vs UDP differences"
+  Code: 512-token max, "binary search Python function"
+  JSON: 1024-token max, "10 fictional employees"
+  Math: 64-token max, "7823 * 4519"
+  LongCode: 2048-token max, "complete red-black tree implementation"
+
+Setup notes / patches dropped:
+  - vLLM 0.20.0 + PR #40898 alone (not #40727 — they conflict; #40898 supersedes #40727)
+  - vLLM 0.20.0 reorganized requirements/{test,build}/cuda.txt; install.sh sed remaps the
+    legacy paths in the upstream eugr Dockerfile
+  - inc.py override_quantization_method() and maybe_update_config() got hf_config kwarg
+    in vLLM 0.20.x; we accept-and-ignore (default None) for both 0.19/0.20 compat
+  - All patches kept; nothing dropped
+
+
+────────────────────────────────────────────────────────────────────────────────
+RUN 1 — DFlash, num_speculative_tokens=15
+────────────────────────────────────────────────────────────────────────────────
+
+╔══════════════════════════════════════════════════════╗
+║  Qwen3.5-122B-A10B Benchmark: v2-dflash-k15-122b
+║  Mon Apr 27 10:02:53 PM EEST 2026
+╚══════════════════════════════════════════════════════╝
+
+── Run 1/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 10.88s = 23.5 tok/s (prompt: 23)
+  [Code] 510 tokens in 15.82s = 32.2 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 44.73s = 22.8 tok/s (prompt: 48)
+  [Math] 64 tokens in 2.90s = 22.0 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 62.15s = 32.9 tok/s (prompt: 37)
+
+── Run 2/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 10.98s = 23.3 tok/s (prompt: 23)
+  [Code] 512 tokens in 14.85s = 34.4 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 43.95s = 23.2 tok/s (prompt: 48)
+  [Math] 64 tokens in 2.66s = 24.0 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 65.40s = 31.3 tok/s (prompt: 37)
+
+  Run-2 mean: (23.3 + 34.4 + 23.2 + 24.0 + 31.3) / 5 = 27.2 tok/s
+
+────────────────────────────────────────────────────────────────────────────────
+RUN 2 — DFlash, num_speculative_tokens=5
+────────────────────────────────────────────────────────────────────────────────
+
+╔══════════════════════════════════════════════════════╗
+║  Qwen3.5-122B-A10B Benchmark: v2-dflash-k5-122b
+║  Mon Apr 27 10:20:03 PM EEST 2026
+╚══════════════════════════════════════════════════════╝
+
+── Run 1/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 58.42s = 4.3 tok/s (prompt: 23)        # cold start, discard
+  [Code] 501 tokens in 9.92s = 50.5 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 25.08s = 40.8 tok/s (prompt: 48)
+  [Math] 64 tokens in 1.65s = 38.7 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 40.13s = 51.0 tok/s (prompt: 37)
+
+── Run 2/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 6.54s = 39.1 tok/s (prompt: 23)
+  [Code] 498 tokens in 10.14s = 49.1 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 26.27s = 38.9 tok/s (prompt: 48)
+  [Math] 64 tokens in 1.66s = 38.5 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 39.68s = 51.6 tok/s (prompt: 37)
+
+  Run-2 mean: (39.1 + 49.1 + 38.9 + 38.5 + 51.6) / 5 = 43.4 tok/s
+
+────────────────────────────────────────────────────────────────────────────────
+SUMMARY (run-2 only, steady state)
+────────────────────────────────────────────────────────────────────────────────
+
+| k     | Q&A  | Code | JSON | Math | LongCode | Mean | vs master 51 |
+|-------|------|------|------|------|----------|------|--------------|
+| k=5   | 39.1 | 49.1 | 38.9 | 38.5 | 51.6     | 43.4 | -15%         |
+| k=15  | 23.3 | 34.4 | 23.2 | 24.0 | 31.3     | 27.2 | -47%         |
+
+Recommendation: k=5 on this hardware. k=15 is the upstream-recommended default
+(designed for B200 with fa3 + cheap verifier) but on single-Spark INT4-Hybrid the
+verifier cost dominates by k=15 — DFlash drafts 15 tokens, vLLM accepts ~3-4,
+the rest are wasted forward-pass work.
+
+Master branch (single-Spark, same hybrid+INT8 LM Head, MTP-2) records 51 tok/s.
+DFlash on this hardware does NOT beat master at any k tested.
+
+Headline (k=5): 43.4 tok/s mean, 51.6 tok/s peak (LongCode). Master MTP-2 is 51 tok/s
+mean, ~52 tok/s peak. DFlash and MTP-2 converge on long repetitive output but
+DFlash trails on short answers by ~10 tok/s due to the larger fixed draft block.

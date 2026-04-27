@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
 #
-# install.sh — automated build pipeline for DGX_Spark Qwen3.5-122B v2 (Steps 0-4).
+# install.sh — automated build pipeline for DGX_Spark Qwen3.5-122B v2-dflash (Steps 0-4).
 #
 # Walks through the Quick Start of README.md from a fresh clone:
 #   0. Download Intel/Qwen3.5-122B-A10B-int4-AutoRound (~75 GB if not cached)
 #   1. Build hybrid INT4+FP8 checkpoint               (~20 min, +9% perf, optional)
-#   2. Add MTP speculative decoding weights
+#   2. Download DFlash drafter z-lab/Qwen3.5-122B-A10B-DFlash (~1 GB)
 #   3. Build base vLLM image for SM121                (~30-60 min, runs Docker)
-#   4. Build vllm-qwen35-v2 final image
+#      - vLLM 0.20.0 + PR #40898 (Qwen3.5-122B DFlash interleaved-SWA support)
+#   4. Build vllm-qwen35-v2-dflash final image
 #
 # Out of scope: TurboQuant variant (run patches/04-turboquant/* manually if needed),
-# Step 5 (launch) and Step 6 (benchmark) — those are runtime, see README.md.
+# the legacy MTP variant (use the master branch), Step 5 (launch) and Step 6
+# (benchmark) — those are runtime, see README.md.
 #
 # Idempotent: re-running skips steps whose outputs already exist.
 # Run from anywhere: `./install.sh` from this repo, or `bash /path/to/install.sh`.
 #
 # Flags:
-#   --no-cache       Force a clean rebuild: removes existing vllm-sm121 and
-#                    vllm-qwen35-v2 images, prunes BuildKit cache, then runs
-#                    Steps 3 & 4 from scratch. Use if a previous failed build
-#                    left stale BuildKit layers. Adds 30-60 min.
+#   --no-cache       Force a clean rebuild: removes existing vllm-sm121-dflash
+#                    and vllm-qwen35-v2-dflash images, prunes BuildKit cache,
+#                    then runs Steps 3 & 4 from scratch. Use if a previous
+#                    failed build left stale BuildKit layers. Adds 30-60 min.
 #   --launch         After build, automatically launch the container (Step 5).
 #                    Default: prompts interactively. With --launch, no prompt.
 #   --no-launch      Never launch, never prompt. Useful for CI / unattended runs.
@@ -35,7 +37,18 @@ set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPARK_VLLM_DIR="${PROJECT_DIR}/spark-vllm-docker"
 HYBRID_DIR="${HOME}/models/qwen35-122b-hybrid-int4fp8"
+DFLASH_DRAFTER_REPO="z-lab/Qwen3.5-122B-A10B-DFlash"
 SPARK_VLLM_PIN="49d6d9fefd7cd05e63af8b28e4b514e9d30d249f"
+
+# vLLM source target for DFlash. PR #40898 adds Qwen3.5-122B-DFlash interleaved-SWA
+# support AND incorporates the target_layer_ids+1 offset semantics that PR #40727
+# introduced. We tried applying both #40727 then #40898 against v0.20.0 — that
+# fails because #40898 is a SUPERSEDING patch (different base SHA, different
+# implementation of the +1 shift). Applying only #40898 against v0.20.0 cleanly
+# delivers both fixes. (The earlier "two PRs needed" guidance came from the AEON-7
+# community port which combined them as one diff.)
+VLLM_REF="v0.20.0"
+VLLM_PRS="40898"
 
 # Frozen PyTorch nightly versions — these MUST be identical to what's inside
 # our reference vllm-qwen35-v2:latest image. Upstream eugr/spark-vllm-docker
@@ -277,36 +290,42 @@ else
     step_end
 fi
 
-# ── Step 2: MTP weights ───────────────────────────────────────────────────────
-if [ -f "${MODEL_DIR}/model_extra_tensors.safetensors" ] \
-    && grep -q '"mtp\.' "${MODEL_DIR}/model.safetensors.index.json" 2>/dev/null; then
+# ── Step 2: DFlash drafter ────────────────────────────────────────────────────
+# DFlash uses a separate ~0.5B drafter model (BF16, ~1 GB). vLLM resolves it
+# from the HF hub at runtime, but pre-downloading on the host means the first
+# container launch doesn't have to do it inside Docker (where HF cache may not
+# be mounted) and benchmark-time latency is deterministic.
+DFLASH_DRAFTER_DIR=$(hf download "${DFLASH_DRAFTER_REPO}" --quiet 2>/dev/null || true)
+if [ -n "${DFLASH_DRAFTER_DIR}" ] && [ -d "${DFLASH_DRAFTER_DIR}" ] \
+    && [ -f "${DFLASH_DRAFTER_DIR}/config.json" ]; then
     STEP_NUM=$((STEP_NUM + 1))
-    step_skip "Step 2 — MTP weights already present in ${MODEL_DIR}"
+    step_skip "Step 2 — DFlash drafter already cached at ${DFLASH_DRAFTER_DIR}"
 else
-    step_begin "Step 2 — Adding MTP speculative decoding weights" \
-               "copies model_extra_tensors.safetensors (~5 GB) and registers 785 tensors in the index"
-    python "${PROJECT_DIR}/patches/02-mtp-speculative/add-mtp-weights.py" \
-        --source "${INTEL_DIR}" \
-        --target "${MODEL_DIR}"
+    step_begin "Step 2 — Downloading DFlash drafter ${DFLASH_DRAFTER_REPO}" \
+               "first time: ~1 GB BF16 with progress bar; cached: instant"
+    hf download "${DFLASH_DRAFTER_REPO}"
+    DFLASH_DRAFTER_DIR=$(hf download "${DFLASH_DRAFTER_REPO}" --quiet)
+    [ -d "$DFLASH_DRAFTER_DIR" ] || abort "DFLASH_DRAFTER_DIR not found after hf download: '${DFLASH_DRAFTER_DIR}' is not a directory."
+    note "DFLASH_DRAFTER_DIR=${DFLASH_DRAFTER_DIR}"
     step_end
 fi
 
 # ── --no-cache: nuke existing images and BuildKit cache ──────────────────────
 if [ "$NO_CACHE" = "1" ]; then
     log "${C_YEL}--no-cache: removing existing images and pruning BuildKit cache${C_OFF}"
-    docker rmi -f vllm-qwen35-v2:latest 2>/dev/null || true
-    docker rmi -f vllm-sm121:latest    2>/dev/null || true
+    docker rmi -f vllm-qwen35-v2-dflash:latest 2>/dev/null || true
+    docker rmi -f vllm-sm121-dflash:latest    2>/dev/null || true
     docker builder prune -af >/dev/null 2>&1 || true
     note "all stale layers gone — Step 3 will rebuild from scratch"
 fi
 
-# ── Step 3: build vllm-sm121 ──────────────────────────────────────────────────
-if docker image inspect vllm-sm121:latest >/dev/null 2>&1; then
+# ── Step 3: build vllm-sm121-dflash ───────────────────────────────────────────
+if docker image inspect vllm-sm121-dflash:latest >/dev/null 2>&1; then
     STEP_NUM=$((STEP_NUM + 1))
-    step_skip "Step 3 — vllm-sm121:latest already exists (delete with 'docker rmi vllm-sm121' to rebuild, or pass --no-cache)"
+    step_skip "Step 3 — vllm-sm121-dflash:latest already exists (delete with 'docker rmi vllm-sm121-dflash' to rebuild, or pass --no-cache)"
 else
-    step_begin "Step 3 — Building vllm-sm121 base image for SM121" \
-               "first build: ~30-60 min (compiles vLLM, FlashInfer, NCCL for SM121); cached: ~3 min"
+    step_begin "Step 3 — Building vllm-sm121-dflash base image for SM121" \
+               "first build: ~30-60 min (vLLM ${VLLM_REF} + PRs ${VLLM_PRS} + FlashInfer + NCCL for SM121); cached: ~3 min"
 
     # Clone or refresh upstream
     if [ ! -d "${SPARK_VLLM_DIR}/.git" ]; then
@@ -368,34 +387,65 @@ else
             "${SPARK_VLLM_DIR}/Dockerfile"
     fi
 
+    # vLLM 0.20.0 reorganized requirements/: top-level test.txt and build.txt
+    # were moved into requirements/test/cuda.txt and requirements/build/cuda.txt
+    # respectively. The eugr Dockerfile predates that reorg and still tries to
+    # sed the legacy paths; left unfixed it dies with
+    #   sed: can't read requirements/test.txt: No such file or directory
+    # at the "Prepare build requirements" stage. Patch the Dockerfile to use
+    # the new path layout. (cuda.txt is unchanged at top level.)
+    sed -i \
+        -e 's|requirements/test\.txt|requirements/test/cuda.txt|g' \
+        -e 's|requirements/build\.txt|requirements/build/cuda.txt|g' \
+        "${SPARK_VLLM_DIR}/Dockerfile"
+    if ! grep -q 'requirements/build/cuda\.txt' "${SPARK_VLLM_DIR}/Dockerfile" \
+        || ! grep -q 'requirements/test/cuda\.txt' "${SPARK_VLLM_DIR}/Dockerfile"; then
+        abort "v0.20 requirements path rewrite didn't land — upstream Dockerfile may have changed shape."
+    fi
+    note "remapped requirements/{test,build}.txt → requirements/{test,build}/cuda.txt for vLLM 0.20+"
+
     # Build (must use build-and-copy.sh, not bare 'docker build', because the
     # upstream Dockerfile COPYs build-metadata.yaml which the script generates
-    # at build time and removes on exit). --vllm-ref v0.19.0 + --tf5 are not
-    # script defaults — they match the build_args of our reference image.
+    # at build time and removes on exit).
+    #
+    # --vllm-ref ${VLLM_REF}      : Bumped from v0.19.0 (master branch) to ${VLLM_REF}
+    #                               for DFlash speculative decoding support (initial
+    #                               DFlash machinery landed in v0.20 via PR #38300).
+    # --apply-vllm-pr 40898       : Interleaved-SWA support for the 122B drafter,
+    #                               required to load Qwen3.5-122B-A10B-DFlash on v0.20.
+    #                               #40898 also incorporates the target_layer_ids+1
+    #                               shift originally introduced in #40727; we do NOT
+    #                               apply #40727 separately because it conflicts with
+    #                               #40898 on the same files.
+    # --tf5                       : Pre-installs HF transformers v5 like the master branch.
     # Note: build-and-copy.sh has no --no-cache flag of its own; cache is
     # already invalidated above (we ran 'docker builder prune -af' if --no-cache
     # was passed to install.sh).
     (
         cd "${SPARK_VLLM_DIR}"
-        ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5 2>&1
+        BUILD_ARGS=(-t vllm-sm121-dflash --vllm-ref "${VLLM_REF}" --tf5)
+        for pr in ${VLLM_PRS}; do
+            BUILD_ARGS+=(--apply-vllm-pr "${pr}")
+        done
+        ./build-and-copy.sh "${BUILD_ARGS[@]}" 2>&1
     )
 
-    docker image inspect vllm-sm121:latest >/dev/null 2>&1 \
-        || abort "vllm-sm121:latest is not in 'docker images' after build-and-copy.sh — something failed silently."
+    docker image inspect vllm-sm121-dflash:latest >/dev/null 2>&1 \
+        || abort "vllm-sm121-dflash:latest is not in 'docker images' after build-and-copy.sh — something failed silently."
     step_end
 fi
 
-# ── Step 4: build vllm-qwen35-v2 ──────────────────────────────────────────────
-if docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1; then
+# ── Step 4: build vllm-qwen35-v2-dflash ───────────────────────────────────────
+if docker image inspect vllm-qwen35-v2-dflash:latest >/dev/null 2>&1; then
     STEP_NUM=$((STEP_NUM + 1))
-    step_skip "Step 4 — vllm-qwen35-v2:latest already exists (delete with 'docker rmi vllm-qwen35-v2' to rebuild, or pass --no-cache)"
+    step_skip "Step 4 — vllm-qwen35-v2-dflash:latest already exists (delete with 'docker rmi vllm-qwen35-v2-dflash' to rebuild, or pass --no-cache)"
 else
-    step_begin "Step 4 — Building vllm-qwen35-v2 (final image)" \
-               "thin layer on top of vllm-sm121: copies hybrid INC patch and bakes INT8 LM Head v2 patch"
+    step_begin "Step 4 — Building vllm-qwen35-v2-dflash (final image)" \
+               "thin layer on top of vllm-sm121-dflash: copies hybrid INC patch and bakes INT8 LM Head v2 patch"
     cd "${PROJECT_DIR}"
-    docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
-    docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1 \
-        || abort "vllm-qwen35-v2:latest is not in 'docker images' after build."
+    docker build -t vllm-qwen35-v2-dflash -f docker/Dockerfile.v2-dflash .
+    docker image inspect vllm-qwen35-v2-dflash:latest >/dev/null 2>&1 \
+        || abort "vllm-qwen35-v2-dflash:latest is not in 'docker images' after build."
     step_end
 fi
 
@@ -407,8 +457,8 @@ ok "All build steps complete in $(fmt_time $TOTAL)"
 echo "${C_GRN}════════════════════════════════════════════════════════════════════${C_OFF}"
 echo
 log "Images:"
-docker images vllm-sm121     --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
-docker images vllm-qwen35-v2 --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
+docker images vllm-sm121-dflash     --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
+docker images vllm-qwen35-v2-dflash --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
 echo
 log "Model:"
 echo "   ${MODEL_DIR}"
@@ -420,16 +470,18 @@ MODELS_PARENT=$(dirname "${MODEL_DIR}")
 
 LAUNCH_CMD="docker run -d --name vllm-qwen35 \\
     --gpus all --net=host --ipc=host \\
+    -v ~/.cache/huggingface:/root/.cache/huggingface \\
     -v ${MODELS_PARENT}:/models \\
-    vllm-qwen35-v2 \\
+    vllm-qwen35-v2-dflash \\
     serve /models/${MODEL_BASENAME} \\
     --served-model-name qwen \\
     --port 8000 \\
     --max-model-len 262144 \\
-    --gpu-memory-utilization 0.90 \\
+    --max-num-batched-tokens 4096 \\
+    --gpu-memory-utilization 0.85 \\
     --reasoning-parser qwen3 \\
-    --attention-backend FLASHINFER \\
-    --speculative-config '{\"method\":\"mtp\",\"num_speculative_tokens\":2}'"
+    --attention-backend FLASH_ATTN \\
+    --speculative-config '{\"method\":\"dflash\",\"model\":\"${DFLASH_DRAFTER_REPO}\",\"num_speculative_tokens\":5}'"
 
 # Measured on a real DGX Spark first-launch run from this exact image:
 # weights load 9m45s + compile/warmup 2m51s + graph capture/engine 29s
@@ -446,9 +498,15 @@ Wait ~13 min for model load + warmup, then:
 
   curl http://127.0.0.1:8000/health
 
+Benchmark a single config:
+  ./bench_qwen35.sh "v2-dflash-k5"
+
+Sweep num_speculative_tokens:
+  ./bench_dflash_sweep.sh
+
 For TurboQuant (4× KV cache, -22% speed) see the "Optional: TurboQuant
 KV Cache Compression" section in README.md — that variant is intentionally
-outside this install script. Benchmark with: ./bench_qwen35.sh "v2"
+outside this install script.
 EOF
 }
 

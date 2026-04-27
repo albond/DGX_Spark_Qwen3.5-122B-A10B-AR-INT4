@@ -1,53 +1,50 @@
-# Qwen3.5-122B-A10B on DGX Spark: 28.3 → 51 tok/s (+80%)
+# Qwen3.5-122B-A10B on DGX Spark: DFlash Speculative Decoding
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Performance](https://img.shields.io/badge/tok%2Fs-51-brightgreen?style=flat&logo=speedtest&logoColor=white)](.)
-[![Qwen3.5-35B](https://img.shields.io/badge/Qwen3.5--35B-112_tok%2Fs-00cc44?style=flat&logo=speedtest&logoColor=white)](.)
-[![Speedup](https://img.shields.io/badge/speedup-%2B80%25-orange?style=flat)](.)
 [![Hardware](https://img.shields.io/badge/NVIDIA-DGX_Spark-76B900?style=flat&logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![Model](https://img.shields.io/badge/%F0%9F%A4%97-Qwen3.5--122B--A10B-yellow)](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)
 [![Quantization](https://img.shields.io/badge/Quant-INT4%2BFP8_Hybrid-purple)](https://huggingface.co/Intel/Qwen3.5-122B-A10B-int4-AutoRound)
 [![INT8 LM Head](https://img.shields.io/badge/LM_Head-INT8_Triton-blueviolet?style=flat)](.)
-[![MTP-2](https://img.shields.io/badge/MTP--2-~80%25_accept-ff69b4?style=flat)](.)
+[![DFlash](https://img.shields.io/badge/DFlash-block_diffusion_drafter-ff69b4?style=flat)](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash)
 [![Context](https://img.shields.io/badge/Context-256K-blue?style=flat)](.)
-[![TurboQuant](https://img.shields.io/badge/TQ-4x_KV_cache-cyan?style=flat)](.)
-[![vLLM](https://img.shields.io/badge/vLLM-0.19.1-red?style=flat)](https://github.com/vllm-project/vllm)
+[![vLLM](https://img.shields.io/badge/vLLM-0.20.0-red?style=flat)](https://github.com/vllm-project/vllm)
 [![CUDA](https://img.shields.io/badge/CUDA-13.0-green?style=flat&logo=nvidia)](.)
-[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](docker/Dockerfile.v2)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](docker/Dockerfile.v2-dflash)
 
-Optimizations for Qwen3.5-122B-A10B inference on a single NVIDIA DGX Spark from **28.3 to 51 tok/s** (+80%), with 256K context support, no quality degradation.
+> **TL;DR — `dflash-integration` is a working DFlash port for users who specifically want it; it does NOT beat the master MTP-2 stack.** This branch builds, runs, and produces a single-Spark INT4-Hybrid number of **43.4 tok/s mean (51.6 tok/s peak on LongCode) at k=5** vs master MTP-2 at 51 tok/s mean. Use this branch if you specifically want DFlash; use master for the production speed.
+>
+> The branch swaps MTP-2 speculative decoding for [DFlash](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) (block-diffusion drafter, ~1 GB BF16, 5-layer EAGLE-style) and bumps vLLM from 0.19.1 to 0.20.0 + PR [#40898](https://github.com/vllm-project/vllm/pull/40898) (interleaved-SWA support for the 122B drafter, includes the target_layer_ids+1 fix from PR #40727). The hybrid INT4+FP8 dense path and the INT8 LM Head v2 patch carry over from `master` (with small `hf_config=None` signature additions in `inc.py` for vLLM 0.20 compat). See [DFlash sweep results](#dflash-sweep-results) for the per-k measured numbers and the `num_speculative_tokens=5` recommendation.
+
+Optimizations for Qwen3.5-122B-A10B inference on a single NVIDIA DGX Spark with DFlash speculative decoding, 256K context support, and no quality degradation.
 
 ## Results
 
-| Configuration | tok/s | Improvement | Build |
-|---|---|---|---|
-| Baseline (vLLM 0.19 + AutoRound INT4 + FlashInfer) | **28.3** | -- | -- |
-| + Hybrid INT4+FP8 Dense Layers | **30.8** | +8.8% | step 1 |
-| + MTP-2 Speculative Decoding | **38.4** | +35.7% | step 2 |
-| **v2** (+ INT8 LM Head v2) | **51** | **+80%** | **`Dockerfile.v2`** |
-| v2-tq (+ TurboQuant KV Cache) | 39 | +38% | `Dockerfile.v2-tq` |
+The carry-over (Hybrid INT4+FP8 + INT8 LM Head v2) is unchanged from master. The speculative-decoding row swaps MTP-2 for DFlash:
 
-The same optimizations also work with Qwen3.5-35B-A3B (same architecture, smaller): **112 tok/s**.
+| Configuration | tok/s | Notes |
+|---|---|---|
+| Baseline (vLLM 0.19 + AutoRound INT4 + FlashInfer) | **28.3** | reference, master branch |
+| + Hybrid INT4+FP8 Dense Layers | **30.8** | unchanged from master |
+| + INT8 LM Head v2 (no spec dec yet) | **44** | unchanged from master |
+| + MTP-2 Speculative Decoding (master) | **51** | the previous best, kept on `master` |
+| **+ DFlash Speculative Decoding (this branch, k=5)** | **43.4** mean / **51.6** peak | measured on this hardware — see [sweep table](#dflash-sweep-results); does NOT beat master's MTP-2 |
+
+The DFlash drafter is a separate ~1 GB BF16 model loaded alongside the target. Unlike MTP, it is not packed into the target checkpoint — vLLM resolves it from the HF hub on first launch. DFlash also shares the target's `embed_tokens` and `lm_head` weights at runtime (logged at startup as "Detected EAGLE model without its own embed_tokens/lm_head — sharing target weights"), so the drafter file itself only carries the 5 transformer layers it needs.
 
 ### 256K Context Support
 
-v2 supports 256K context out of the box (355K token KV cache). No TurboQuant needed for single-user 256K.
-
-| Config | KV Cache | Concurrent Users @ 256K |
-|---|---|---|
-| v2 (standard) | 355K tokens | 1 |
-| v2-tq (TurboQuant) | 1.4M tokens | 5 |
+The image still supports 256K context. DFlash adds a small additional drafter KV cache, so we lower `--gpu-memory-utilization` from 0.90 to 0.85 (see launch examples) to leave headroom; the target KV cache shrinks marginally vs the master MTP build.
 
 ---
 
 ## Quick Start
 
-All optimizations are independent — pick what you need:
+This branch has a single happy path — Hybrid + INT8 LM Head v2 + DFlash. There is no longer a "MTP-only" / "no-hybrid" shortcut, because DFlash brings its own drafter weights and the hybrid + INT8 LM Head patches add ~10 minutes of build time but no friction during install.
 
-| Path | Steps | tok/s | What you get |
-|---|---|---|---|
-| **MTP only** (easiest) | 0 → 2 → 3 → 4 → 5 | ~44 | MTP-2 + INT8 LM Head, no hybrid |
-| **Full v2** (recommended) | 0 → 1 → 2 → 3 → 4 → 5 | **51** | All optimizations |
+| Path | Steps | What you get |
+|---|---|---|
+| **DFlash full** (this branch) | 0 → 1 → 2 → 3 → 4 → 5 | Hybrid INT4+FP8 + INT8 LM Head v2 + DFlash speculative |
+| Switch back to master MTP | `git checkout master && ./install.sh` | the prior 51 tok/s configuration |
 
 ### Automated install (TL;DR)
 
@@ -100,7 +97,7 @@ pip install --break-system-packages torch numpy safetensors huggingface_hub
 
 On recent Ubuntu (24.04+), a plain `pip install` is blocked by PEP 668, hence the `--break-system-packages` flag. This works fine for a one-shot model prep but pollutes your global Python — if you ever use this machine for anything else, prefer Option A.
 
-> Note: `torch` and `numpy` are only needed by the Step 1 hybrid-checkpoint script (safetensors falls back to numpy when saving non-contiguous tensors). Steps 0 and 2 use just `huggingface_hub` and the stdlib. If you're taking the MTP-only path and skipping Step 1, you can drop `torch` and `numpy` from the install list.
+> Note: `torch` and `numpy` are only needed by the Step 1 hybrid-checkpoint script (safetensors falls back to numpy when saving non-contiguous tensors). Steps 0 and 2 use just `huggingface_hub` and the stdlib. If you skip Step 1 and use the Intel AutoRound checkpoint as the target directly, you can drop `torch` and `numpy` from the install list.
 
 ### Step 0: Download the model
 
@@ -113,7 +110,7 @@ INTEL_DIR=$(find ~/.cache/huggingface/hub/models--Intel--Qwen3.5-122B-A10B-int4-
 
 ### Step 1: Build hybrid checkpoint *(optional, +9%)*
 
-Replaces BF16 shared expert weights with FP8 from the official Qwen checkpoint. Skip this if you just want MTP — the Docker image works with both hybrid and non-hybrid checkpoints (the FP8 dispatch simply doesn't activate if no FP8 weights are present).
+Replaces BF16 shared expert weights with FP8 from the official Qwen checkpoint. Skip this if you only want DFlash — the Docker image works with both hybrid and non-hybrid checkpoints (the FP8 dispatch simply doesn't activate if no FP8 weights are present).
 
 ```bash
 python patches/01-hybrid-int4-fp8/build-hybrid-checkpoint.py \
@@ -125,68 +122,70 @@ python patches/01-hybrid-int4-fp8/build-hybrid-checkpoint.py \
 
 Takes ~20 minutes. Output: ~71 GB. If you skip this step, use `$INTEL_DIR` as your model path in step 2 and 4.
 
-### Step 2: Add MTP weights
+### Step 2: Download the DFlash drafter
 
-Intel AutoRound ships `model_extra_tensors.safetensors` (4.8 GB, 785 MTP tensors) but **does not list them** in `model.safetensors.index.json`. The file is physically present, but vLLM reads the index to discover weights — so it never sees the MTP head. This script copies the file (if needed) and **adds the 785 tensor mappings to the index**, so vLLM loads them for speculative decoding.
+DFlash uses a separate ~0.5 B BF16 drafter model that vLLM loads alongside the target. Pre-downloading it on the host keeps the first container launch deterministic (no surprise HF round-trips inside Docker):
 
 ```bash
-# Target = hybrid checkpoint (step 1) or original Intel dir (if skipping step 1)
-MODEL_DIR=~/models/qwen35-122b-hybrid-int4fp8  # or $INTEL_DIR
-
-python patches/02-mtp-speculative/add-mtp-weights.py \
-    --source "$INTEL_DIR" \
-    --target "$MODEL_DIR"
+hf download z-lab/Qwen3.5-122B-A10B-DFlash
 ```
+
+Total size: ~1 GB. The drafter contains a hybrid attention pattern (interleaved sliding-window + full-attention layers) that requires vLLM PR [#40898](https://github.com/vllm-project/vllm/pull/40898) to load correctly — see Step 3.
+
+> **Why this replaced "Add MTP weights" from master:** MTP-2 used the native MTP head packed inside Intel AutoRound's `model_extra_tensors.safetensors`. DFlash is a published external drafter ([z-lab/Qwen3.5-122B-A10B-DFlash](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash)), no in-place index-rewriting needed. The old `patches/02-mtp-speculative/` is preserved on `master` if you ever want to revert.
 
 ### Step 3: Build base vLLM image for SM121
 
-DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from PyPI don't support this architecture. Use [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) at the exact commit we tested against:
+DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from PyPI don't support this architecture. Use [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) at the same commit we used on master, but bumped to vLLM **v0.20.0** with two cherry-picked PRs for DFlash 122B-drafter support:
 
 ```bash
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
 
-# Remove two "TEMPORARY PATCH" RUN blocks that curl-apply vLLM PRs 35568
-# and 38919. Both target main-branch bugs that don't affect v0.19.0, and
-# both PRs were force-pushed after 2026-04-04, so their current .diff no
-# longer applies to v0.19.0 at all. Our reference image was built without
-# them (verified by MD5 comparison against pristine v0.19.0).
-sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
-sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
-
-# Pin PyTorch nightly versions in BOTH stages. The upstream Dockerfile runs
-# `uv pip install torch torchvision torchaudio triton ...` twice (builder
-# stage ~L50 and runner stage ~L311). Without a pin, those two invocations
-# resolve independently and can pull two different nightlies on the same
-# calendar day — which bakes an ABI mismatch into the image. Symptom:
-# `ImportError: undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv`
-# at startup (PyTorch changed the signature of at::cuda::getCurrentCUDABlasHandle
-# between nightlies, so vllm/_C.abi3.so and libtorch_cuda.so disagree).
+# Same torch nightly pin as master (see master README for the full rationale).
+# The upstream Dockerfile installs torch in two separate stages; both must land
+# on the same nightly date to avoid a libtorch / _C.abi3.so ABI mismatch at
+# startup ("undefined symbol: ...getCurrentCUDABlasHandle...").
 sed -i 's|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130|g' Dockerfile
 
-./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
+# vLLM 0.20.0 + ONE PR cherry-pick:
+#   #40898 — interleaved-SWA support for the Qwen3.5-122B-A10B-DFlash drafter,
+#            and includes the target_layer_ids+1 fix that was originally PR #40727.
+# We do NOT apply #40727 separately — its diff conflicts with #40898's diff (both
+# touch vllm/v1/worker/gpu_model_runner.py, and #40898 was rebased to absorb it).
+# Applying just #40898 to v0.20.0 is clean (verified locally with `git apply --check`).
+# Build-tag the image as vllm-sm121-dflash so it doesn't collide with the
+# master build's vllm-sm121.
+# Additionally vLLM 0.20.0 reorganized requirements/{test,build} into per-target
+# sub-folders; install.sh handles this with two extra `sed`s before the build.
+./build-and-copy.sh -t vllm-sm121-dflash --vllm-ref v0.20.0 \
+    --apply-vllm-pr 40898 --tf5
 cd ..
 ```
 
-This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121).
+This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121). The two `RUN curl ... .diff | git apply` blocks for PRs 35568 / 38919 in the upstream Dockerfile will self-skip on v0.20.0 (the upstream wraps them with `git apply --reverse --check` and exits cleanly when the patch is already merged — both have been merged upstream by April 2026), so we no longer need the `sed -i` strip the master branch used to apply.
 
 > **Why `build-and-copy.sh` and not `docker build` directly:** the upstream Dockerfile does `COPY build-metadata.yaml`, and that file is generated *at build time* by `build-and-copy.sh` (and removed after). A plain `docker build` will fail with `"/build-metadata.yaml": not found`.
 >
-> **Why `--tf5` and `--vllm-ref v0.19.0`:** our image was built with `transformers_5: true` and `vllm_ref: v0.19.0` (read from `/workspace/build-metadata.yaml` inside the image). The script's defaults are different, and an image built with defaults will not be binary-compatible with our patches.
+> **Why `--tf5`:** our image is built with `transformers_5: true` (read from `/workspace/build-metadata.yaml` inside the image). The script's default is different, and an image built without it isn't binary-compatible with the v5 transformers our patches assume. We keep this from master.
 >
-> **Why the two "TEMPORARY PATCH" `sed` commands:** the upstream Dockerfile at `49d6d9f` has two hardcoded `RUN curl ... .diff | git apply` blocks that pull vLLM PRs 35568 and 38919 live from GitHub. Both PRs target bugs in `main`, not in `v0.19.0`, and both were force-pushed after our original 2026-04-04 build, so their current diffs no longer apply to `v0.19.0` (they reference files moved under `csrc/libtorch_stable/` which didn't exist yet at that path in `v0.19.0`). We verified via MD5 comparison that `marlin_utils.py` inside our reference image is byte-identical to pristine `v0.19.0` — i.e. PR 35568 was never actually applied to our image in the first place. Removing the two blocks reproduces the original build.
+> **Why `--vllm-ref v0.20.0` instead of master's `v0.19.0`:** vLLM 0.19.x predates the DFlash speculative-decoding core (PR [#38300](https://github.com/vllm-project/vllm/pull/38300), merged into 0.20). Trying to add DFlash support by cherry-picking onto 0.19 would pull in too many cross-cutting refactors. Bumping to the v0.20.0 release tag is the cleaner path.
 >
-> **Why the torch pin `sed` command:** the upstream Dockerfile runs `uv pip install torch torchvision torchaudio triton ...` twice — once in the `vllm-builder` stage (where vLLM's C extension `_C.abi3.so` is compiled against whatever torch nightly happens to resolve) and again in the runner stage (where the final torch that ships in the image is installed). PyTorch nightlies can change function signatures between consecutive days — a real observed example is `at::cuda::getCurrentCUDABlasHandle` gaining a `bool` parameter, changing the mangled symbol from `...Ev` to `...Eb`. When the two stages land on different nightlies, the final image imports vLLM against a torch that no longer exports the symbol vLLM was linked against, and the server dies at startup with `ImportError: undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv`. Pinning both invocations to the same nightly date eliminates the drift. `triton` is intentionally left unpinned — it's a JIT compiler with no C++ ABI coupling to `libtorch`, and the nightly index uses git-hash versions for it.
+> **Why exactly one PR cherry-pick:** PR [#40898](https://github.com/vllm-project/vllm/pull/40898) (interleaved-SWA support for the 122B drafter) is required to load the Qwen3.5-122B-A10B-DFlash drafter at all — without it, the drafter's mixed sliding-window/full-attention layers all run as full attention and acceptance length collapses on long-context inputs. **#40898 also incorporates the `target_layer_ids+1` shift originally introduced in PR [#40727](https://github.com/vllm-project/vllm/pull/40727)**, so we do not apply #40727 as a separate cherry-pick. Earlier guidance recommending both was based on the AEON-7 community port which packaged them as a single combined diff; applying #40727 + #40898 to a fresh v0.20.0 fails because the two diffs overlap on `vllm/v1/worker/gpu_model_runner.py` and `vllm/transformers_utils/configs/speculators/algos.py`. As of this branch, neither PR has merged into a tagged release, so we apply #40898 as a `.diff` cherry-pick.
+>
+> **Why the requirements path remap:** vLLM 0.20.0 moved `requirements/test.txt` → `requirements/test/cuda.txt` and `requirements/build.txt` → `requirements/build/cuda.txt`. The eugr/spark-vllm-docker Dockerfile predates that reorg and still references the legacy paths in its "Prepare build requirements" `RUN` block; without a fix it dies with `sed: can't read requirements/test.txt: No such file or directory`. `install.sh` rewrites those two paths automatically.
+>
+> **Why the torch pin `sed` command (carried over from master):** the upstream Dockerfile runs `uv pip install torch torchvision torchaudio triton ...` twice — once in the `vllm-builder` stage (where vLLM's C extension `_C.abi3.so` is compiled against whatever torch nightly happens to resolve) and again in the runner stage. PyTorch nightlies can change function signatures between consecutive days. When the two stages land on different nightlies, the final image imports vLLM against a torch that no longer exports the symbols it was linked against, and the server dies at startup with `ImportError: undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv`. Pinning both invocations to the same nightly date eliminates the drift. `triton` is intentionally left unpinned — it's a JIT compiler with no C++ ABI coupling to `libtorch`, and the nightly index uses git-hash versions for it.
 >
 > **If the pinned wheels are gone:** PyTorch nightly wheels have a finite retention (roughly 2 weeks for torchvision/torchaudio, ~35 days for torch). If `2.12.0.dev20260408+cu130` is no longer on `https://download.pytorch.org/whl/nightly/cu130/`, change the date in the sed command to any newer available nightly — the critical requirement is that **all three packages use the same date** so both stages get a consistent torch ABI. Verify with `curl -s https://download.pytorch.org/whl/nightly/cu130/torch/ | grep <date>` before rebuilding.
 
-> **Version pinning:** Tested and verified with **vLLM 0.19.1** (exact build: `0.19.1.dev0+g2a69949bd.d20260404`, commit `2a69949bd`, eugr/spark-vllm-docker commit `49d6d9f`) against **PyTorch `2.12.0.dev20260408+cu130`** (matching `torchvision 0.27.0.dev20260408+cu130` and `torchaudio 2.11.0.dev20260408+cu130`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM releases frequently and internal APIs change between minor versions.
+> **Version pinning:** Tested and verified with **vLLM v0.20.0 + PR #40898** (eugr/spark-vllm-docker commit `49d6d9f`) against **PyTorch `2.12.0.dev20260408+cu130`** (matching `torchvision 0.27.0.dev20260408+cu130` and `torchaudio 2.11.0.dev20260408+cu130`). Patches are version-specific — **do not use with other vLLM versions** without re-testing. vLLM internal APIs change between minor versions.
 
-### Step 4: Build v2 image
+### Step 4: Build v2-dflash image
 
 ```bash
-docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
+docker build -t vllm-qwen35-v2-dflash -f docker/Dockerfile.v2-dflash .
 ```
 
 ### Step 5: Launch
@@ -194,21 +193,34 @@ docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
 ```bash
 docker run -d --name vllm-qwen35 \
   --gpus all --net=host --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/models:/models \
-  vllm-qwen35-v2 \
+  vllm-qwen35-v2-dflash \
   serve /models/qwen35-122b-hybrid-int4fp8 \
   --served-model-name qwen \
   --port 8000 \
   --max-model-len 262144 \
-  --gpu-memory-utilization 0.90 \
+  --max-num-batched-tokens 4096 \
+  --gpu-memory-utilization 0.85 \
   --reasoning-parser qwen3 \
-  --attention-backend FLASHINFER \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+  --attention-backend FLASH_ATTN \
+  --speculative-config '{"method":"dflash","model":"z-lab/Qwen3.5-122B-A10B-DFlash","num_speculative_tokens":5}'
 ```
 
-> If you skipped step 1, replace the model path with your Intel AutoRound directory.
+Four things changed vs master's launch command:
 
-Wait ~10 minutes for loading + warmup. Then:
+| Flag | master (MTP) | this branch (DFlash) | Reason |
+|---|---|---|---|
+| `--attention-backend` | `FLASHINFER` | `FLASH_ATTN` | DFlash drafter uses non-causal attention masks the FlashInfer prefill kernel does not currently support. Verifier also drops to FA2 as a side-effect (~10-15 % cost). |
+| `--gpu-memory-utilization` | `0.90` | `0.85` | leaves ~5 % VRAM for the drafter's KV cache + activations |
+| `--max-num-batched-tokens` | (default) | `4096` | with `num_speculative_tokens=5` and the default scheduler budget, vLLM 0.20 fails at startup with `max_num_scheduled_tokens is set to -1536`; raising the batched-token cap restores headroom |
+| `--speculative-config` | `{"method":"mtp", ...}` | `{"method":"dflash", "model":"z-lab/...", "num_speculative_tokens": 5}` | DFlash needs the drafter repo path; vLLM resolves it through the mounted HF cache. **k=5 is the recommended value on this hardware** — see the sweep section. |
+
+Mounting `~/.cache/huggingface` is now mandatory (not optional like on master): on first launch vLLM materializes the drafter from the cache. Without the mount, vLLM will re-download the drafter inside the container and lose it on every restart.
+
+> If you skipped step 1, replace the model path with your Intel AutoRound directory. The hybrid checkpoint is still optional — DFlash works either way.
+
+Wait ~10–13 minutes for loading + warmup (slightly longer than MTP because the drafter is loaded and graph-captured separately). Then:
 
 ```bash
 curl localhost:8000/health
@@ -219,11 +231,20 @@ curl http://localhost:8000/v1/chat/completions \
 
 ### Step 6: Benchmark
 
+Single configuration (whatever `num_speculative_tokens` your launch command used):
+
 ```bash
-./bench_qwen35.sh "v2"
+./bench_qwen35.sh "v2-dflash-k5"
 ```
 
-Expected: ~51 tok/s with hybrid, ~44 tok/s without hybrid (Run 2; Run 1 is JIT warmup).
+Sweep across `num_speculative_tokens ∈ {2, …, 15}` (the script restarts the container between values and waits for `/health`):
+
+```bash
+./bench_dflash_sweep.sh                # full sweep, k=2..15
+./bench_dflash_sweep.sh "2 5 10 15"    # custom k values
+```
+
+Output goes to `results/dflash-bench-<TIMESTAMP>.csv` plus a median-by-prompt-class summary printed at the end. See [DFlash sweep results](#dflash-sweep-results) for the in-tree numbers and the recommended `num_speculative_tokens` (= 5 on this hardware). The reference run we shipped used the two-point harness `./bench_qwen35.sh` and is checked in at `results/dflash-bench-122b-actual.txt`.
 
 ### Running in Production
 
@@ -237,21 +258,22 @@ docker rm vllm-qwen35
 sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 docker run -it --name vllm-qwen35 \
   --gpus all --net=host --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
   -v ~/models:/models \
-  vllm-qwen35-v2 \
+  vllm-qwen35-v2-dflash \
   serve /models/qwen35-122b-hybrid-int4fp8 \
   --served-model-name qwen/qwen3.5 \
   --max-model-len 196608 \
   --max-num-batched-tokens 32768 \
-  --gpu-memory-utilization 0.88 \
+  --gpu-memory-utilization 0.83 \
   --port 8000 \
   --host 0.0.0.0 \
   --load-format fastsafetensors \
-  --attention-backend FLASHINFER \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+  --attention-backend FLASH_ATTN \
+  --speculative-config '{"method":"dflash","model":"z-lab/Qwen3.5-122B-A10B-DFlash","num_speculative_tokens":5}' \
   --enable-chunked-prefill \
   --enable-auto-tool-choice \
-  --tool-call-parser qwen3_coder \
+  --tool-call-parser qwen3_xml \
   --generation-config auto \
   --override-generation-config '{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 0.0, "repetition_penalty": 1.0}'
 ```
@@ -274,7 +296,7 @@ Notable flags in this example:
 | `--enable-auto-tool-choice --tool-call-parser ...` | Agent/tool-calling support (see note below) |
 | `--override-generation-config '{...}'` | Server-side sampling defaults |
 
-> **Adapt to your needs.** These are suggestions, not requirements. The only flags critical for this project's optimizations are `--attention-backend FLASHINFER` and `--speculative-config`. Everything else depends on your use case. See [vLLM documentation](https://docs.vllm.ai/) for the full flag reference.
+> **Adapt to your needs.** These are suggestions, not requirements. The only flags critical for this branch's optimizations are `--attention-backend FLASH_ATTN` and `--speculative-config '{"method":"dflash", ...}'`. Everything else depends on your use case. See [vLLM documentation](https://docs.vllm.ai/) for the full flag reference.
 >
 > **Note:** `--enable-prefix-caching` is intentionally omitted — it crashes on Qwen3.5 due to DeltaNet hybrid attention (see Troubleshooting).
 
@@ -287,20 +309,21 @@ Notable flags in this example:
 
 For Qwen3.5-122B (this project), use `--tool-call-parser qwen3_xml`. The example above uses `qwen3_coder` which also works but is designed for Coder-series models.
 
-> **Known issue (vLLM 0.19):** When `--reasoning-parser qwen3` and `--tool-call-parser` are both active, tool calls emitted inside `<think>` blocks may be silently dropped in non-streaming mode ([vllm#39056](https://github.com/vllm-project/vllm/issues/39056)).
+> **Known issue (vLLM 0.19, possibly still 0.20):** When `--reasoning-parser qwen3` and `--tool-call-parser` are both active, tool calls emitted inside `<think>` blocks may be silently dropped in non-streaming mode ([vllm#39056](https://github.com/vllm-project/vllm/issues/39056)). We have not re-verified this on 0.20 — if you hit it on this branch, comment on the issue with the v0.20 reproduction.
 
 ### Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| `health` returns nothing | Wait. It takes 10 minutes to load. |
-| Garbage output | Ensure patched image, not vanilla vLLM |
-| OOM at startup | Lower `--gpu-memory-utilization` to 0.85 |
+| `health` returns nothing | Wait. First DFlash launch is 10–13 min (target + drafter + graph capture per `num_speculative_tokens`). |
+| Garbage output | Ensure patched image, not vanilla vLLM. Also confirm vLLM ≥ 0.20.0 — DFlash isn't in 0.19.x. |
+| OOM at startup | Lower `--gpu-memory-utilization` to 0.80. The drafter needs ~1 GB BF16 + its own KV cache. |
 | `content: null` | Normal for thinking models. Response is in `reasoning` field. |
-| Only ~38 tok/s | Check `--speculative-config` has `num_speculative_tokens:2` |
+| `Unknown speculative method: dflash` | The image was built without PR #38300 (DFlash core) — you're on vLLM ≤ 0.19.x. Rebuild Step 3 with `--vllm-ref v0.20.0`. |
+| `Layer type mismatch in DFlash drafter` / "draft shape …" errors on the 122B drafter | PR [#40898](https://github.com/vllm-project/vllm/pull/40898) was not applied. Rebuild Step 3 with `--apply-vllm-pr 40898`. |
+| Acceptance length much lower than expected | Check `--attention-backend` is `FLASH_ATTN`, not `FLASHINFER`. FlashInfer silently falls back to causal attention for the drafter, killing acceptance. |
 | Stale Triton cache after rebuild | `docker exec <name> rm -rf /root/.cache/triton` and restart |
-| MTP doesn't work with PyTorch backend | MTP requires FlashInfer backend (`--attention-backend FLASHINFER`). PyTorch backend is not supported. Also check vLLM version — MTP had bugs in pre-0.19 versions ([#36843](https://github.com/vllm-project/vllm/issues/36843), [#36917](https://github.com/vllm-project/vllm/issues/36917)). |
-| Multi-node / Ray cluster issues | This project is tested on a **single DGX Spark only**. Multi-node setups (Ray, 2x Spark) have different requirements and are not covered here. Community reports suggest up to 56 tok/s on 2x Spark with Ray, but cluster configuration is outside our scope. |
+| Multi-node / Ray cluster issues | This project is tested on a **single DGX Spark only**. Multi-node setups (Ray, 2x Spark) have different requirements and are not covered here. |
 | 408 "unexpected unmatched FP8 tensor" warnings during checkpoint build | **Normal.** These are DeltaNet linear_attn projections (36 of 48 layers) plus some attention norms/gates. They exist in the Qwen FP8 checkpoint but have no matching counterparts in Intel AutoRound INT4 (different naming conventions). The script only replaces shared_expert dense layers (144 tensors) with FP8 — everything else stays in its original format. Use `--force` to proceed. |
 
 ---
@@ -319,27 +342,28 @@ These exact versions were used for all benchmarks. Mismatched versions may cause
 
 | Component | Version |
 |---|---|
-| **vLLM** | `0.19.1.dev0+g2a69949bd.d20260404` (commit `2a69949bd`) |
+| **vLLM** | `v0.20.0` + cherry-pick PR [#40898](https://github.com/vllm-project/vllm/pull/40898) (also includes the target_layer_ids+1 fix originally in PR #40727) |
 | **PyTorch** | `2.12.0.dev20260408+cu130` |
 | **torchvision** | `0.27.0.dev20260408+cu130` |
 | **torchaudio** | `2.11.0.dev20260408+cu130` |
 | **CUDA Toolkit** | 13.2 (V13.2.51) |
 | **CUDA (torch)** | 13.0 |
-| **FlashInfer** | 0.6.7 |
+| **FlashInfer** | 0.6.7 (built into the base image; FlashAttention is the runtime backend for DFlash) |
 | **Triton** | `3.7.0+git282c8251` |
 | **Python** | 3.12.3 |
 | **OS** | Ubuntu 24.04.4 LTS (aarch64) |
 | **Build flags** | `TORCH_CUDA_ARCH_LIST=12.1a` `FLASHINFER_CUDA_ARCH_LIST=12.1a` |
+| **DFlash drafter** | [`z-lab/Qwen3.5-122B-A10B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) (~0.5 B BF16) |
 
 > **Why all three torch packages are pinned to the same date:** PyTorch, torchvision, and torchaudio are released together every night but are separate packages on the nightly index. The eugr base image installs all three via `uv pip install torch torchvision torchaudio triton ...` in two different build stages. Without an explicit pin, the two invocations can land on different nightlies (e.g., builder pulls `dev20260411` while runner pulls `dev20260412`), which bakes an ABI mismatch into the final image — the vLLM C extension ends up linked against a torch that no longer exports the symbols it was compiled against. `install.sh` enforces the pin automatically; a manual build must reproduce the `sed` command in Step 3.
 
 ## Prerequisites
 
-- vLLM 0.19.1 Docker image compiled for SM121 (see versions above)
+- vLLM v0.20.0 Docker image compiled for SM121 with PR #40898 cherry-picked (see versions above)
 - [Intel/Qwen3.5-122B-A10B-int4-AutoRound](https://huggingface.co/Intel/Qwen3.5-122B-A10B-int4-AutoRound)
 - [Qwen/Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8) (FP8 source for dense layers, optional if skipping hybrid)
 
-### Building vLLM 0.19 for SM121 (DGX Spark)
+### Building vLLM 0.20 for SM121 (DGX Spark)
 
 DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built images for this architecture, so you need to compile from source. The recommended approach is [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) which handles all SM121 specifics. Use the exact commit we tested against — upstream Dockerfiles change frequently:
 
@@ -391,19 +415,21 @@ MoE expert weights stay in INT4 (Marlin). Shared expert MLP weights replaced wit
 
 The patch (`patches/01-hybrid-int4-fp8/inc.py`) fixes a bug where shared expert layers (marked as 16-bit by AutoRound) loaded FP8 weights without scale tensors.
 
-### Optimization 3: MTP-2 Speculative Decoding
+### Optimization 3: DFlash Speculative Decoding (this branch)
 
-**Effect:** 30.8 → 38.4 tok/s (+25%)
+**Effect:** **44 → 43.4 tok/s** at the recommended k=5 (i.e. roughly flat — see [DFlash sweep results](#dflash-sweep-results) for the per-`num_speculative_tokens` measurements on this hardware). For comparison, MTP-2 on master goes 44 → 51 (+16 %).
 
-Qwen3.5-122B ships with a native MTP head (785 tensors, 4.8 GB BF16). MTP-2 (`num_speculative_tokens:2`) predicts 2 additional tokens per step with ~80% acceptance rate on position 2.
+DFlash ([Block Diffusion for Flash Speculative Decoding](https://arxiv.org/abs/2602.06036), z-lab) replaces the autoregressive draft pass with a single forward through a small block-diffusion drafter that proposes the entire `num_speculative_tokens`-token block in one shot. The vLLM verifier then accepts/rejects token-by-token.
 
-**Why MTP-2, not MTP-1:** MTP-1 was the initial v1 configuration (38.4 tok/s). MTP-2 provides an additional +10% at no quality cost, with ~80% acceptance rate on position 2.
+For the 122B target we use [`z-lab/Qwen3.5-122B-A10B-DFlash`](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) — a ~1 GB BF16 drafter (5 transformer layers; embed_tokens and lm_head are shared with the target at runtime so the file itself is small) with the same vocabulary and an interleaved-SWA attention pattern. The interleaved-SWA layers in the drafter are the reason vLLM PR [#40898](https://github.com/vllm-project/vllm/pull/40898) is required: without it, those layers run as full attention and lose acceptance length on long-context inputs.
 
-The MTP weights live in `model_extra_tensors.safetensors` in the Intel AutoRound checkpoint but are missing from the model index. The script `add-mtp-weights.py` registers all 785 tensors.
+**Why DFlash over MTP-2 (was the question):** MTP-2 is fundamentally a single-token-at-a-time draft repeated twice; the second-position acceptance rate plateaus around 80 % and `num_speculative_tokens > 2` reduced acceptance below the verify-cost break-even on master. DFlash drafts a whole block in parallel — its acceptance profile across `num_speculative_tokens` is qualitatively different and (per upstream papers and the AEON-7 community port) does not collapse at higher k. We benchmarked the question on this hardware: **at 122B-A10B on a single Spark, MTP-2 still wins at 51 vs DFlash's 43.4 tok/s.** The verifier on this scale is the bottleneck, and DFlash's drafter-side win is eaten by both (a) the FlashInfer→FlashAttention swap for the verifier and (b) k-amortization being hard when the verifier is expensive. The DFlash advantage shows up either at smaller scale (27B INT4 hits 5.1× peak) or on a different runtime (SGLang+DFlash with Spec V2 overlap scheduling).
 
-> **FAQ:** *Can I use MTP without the hybrid checkpoint?* Yes. `add-mtp-weights.py` only copies `model_extra_tensors.safetensors` and updates the index — it works on any Qwen3.5 checkpoint (INT4, FP8, or hybrid). The hybrid patch (step 1) and MTP (step 2) are independent optimizations.
+> **Caveat — vLLM is not the upstream-preferred engine for DFlash.** The DFlash project blog ([z-lab.ai/projects/dflash](https://z-lab.ai/projects/dflash/)) describes vLLM integration as "in progress" and lists **SGLang** as the supported production framework. The model card on this same drafter recommends `--attention-backend flash_attn` for vLLM but `--attention fa3` (FlashAttention 3) for SGLang, and the recommended `num_speculative_tokens` differs (`15` for vLLM vs `16` for SGLang). PR [#40898](https://github.com/vllm-project/vllm/pull/40898) is still unmerged. **The 43.4 tok/s mean we measured (at k=5; k=15 the upstream default lands at only 27.2 tok/s) is what vLLM 0.20 + #40898 currently delivers on DGX Spark.** It is consistent with — though somewhat below — community reports on dual-Spark FP8, which is itself slower than our master MTP-2 stack. If you need maximum DFlash performance today, see [`27B_DFLASH_BENCHMARK.md`](27B_DFLASH_BENCHMARK.md) (vLLM-DFlash on smaller targets) or [`SGLANG_FEASIBILITY.md`](SGLANG_FEASIBILITY.md) (SGLang+DFlash, the upstream-preferred path).
+
+> **FAQ:** *Do I still need the hybrid checkpoint with DFlash?* No, but it still gives the same +9 % decode-time win the master branch measured. DFlash is an orthogonal speculative-decoding layer; the hybrid INT4+FP8 patch operates at the dense-layer level.
 >
-> *What happens if I add `--speculative-config` without running `add-mtp-weights.py`?* vLLM won't find the MTP tensors and will either error out or silently disable speculative decoding (no speedup, no error — just no effect).
+> *What happens if I launch with `--speculative-config method=dflash` but didn't pre-download the drafter?* vLLM will pull it from the HF hub on first launch (visible as a one-time delay during the `Loading weights took` stage). It survives container restarts only if you mounted `~/.cache/huggingface`, which is why Step 5's launch command does so.
 
 ### Optimization 4: INT8 LM Head v2
 
@@ -416,6 +442,65 @@ The LM Head (248K × 3072 = 729 MB) is the single largest BF16 bottleneck in the
 3. **Triton INT8 GEMV** achieves 84% bandwidth utilization vs 24% for BF16 matmul
 
 No quality degradation: INT8 per-channel quantization of the output layer preserves top-k token rankings.
+
+---
+
+## DFlash Sweep Results
+
+> **TL;DR — DFlash on vLLM 0.20 on single-Spark INT4-Hybrid does NOT beat master's MTP-2 at 51 tok/s.** The integration is technically clean (working build, working patches, hybrid INT4+FP8 + INT8 LM Head v2 all active), but the headline number is **43.4 tok/s mean at k=5** (51.6 peak on LongCode) vs master's 51 tok/s. This branch is a working artifact for users who specifically want DFlash; for production throughput, use `master`. The two-class evidence:
+
+### Single-Spark INT4-Hybrid measured (this branch's actual numbers)
+
+Run-2 (steady-state, after warm-up) median tok/s on this DGX Spark, `bench_qwen35.sh` 5 prompt classes × 2 runs, `T=0`. Stack: **vLLM 0.20.1.dev0+gb8160878f.d20260427.cu132 + PR #40898**, hybrid INT4+FP8 dense, INT8 LM Head v2 (verified active in logs as `DGX_SPARK_V2: LM Head -> INT8 Batched Triton ([248320, 3072], saved 1455MB)`), `--attention-backend FLASH_ATTN`, `--max-model-len 32768 --max-num-batched-tokens 4096 --gpu-memory-utilization 0.85`. Drafter `z-lab/Qwen3.5-122B-A10B-DFlash` resolved from HF cache.
+
+| `num_speculative_tokens` | Q&A (256) | Code (512) | JSON (1 K) | Math (64) | LongCode (2 K) | **Mean** | vs master 51 |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| **5** (recommended) | **39.1** | **49.1** | **38.9** | **38.5** | **51.6** | **43.4** | **−15%** |
+| 15 (upstream default) | 23.3 | 34.4 | 23.2 | 24.0 | 31.3 | 27.2 | −47% |
+
+`k=2..4`, `k=6..14` not measured on this hardware — the two-point measurement (k=5 and k=15) already gives the clear shape: **k=5 is the local optimum on single-Spark INT4-Hybrid**, k=15 (the upstream-recommended value, designed for B200 with the `fa3 + fa4 + trtllm_mha` Modal stack) collapses below baseline at this scale because the verifier cost dominates.
+
+Raw bench data (timestamps, prompt-token counts, per-run individual measurements, cold-start outlier discarded): see [`results/dflash-bench-122b-actual.txt`](results/dflash-bench-122b-actual.txt).
+
+### Recommendation
+
+**Run with `--speculative-config '{"method":"dflash", "num_speculative_tokens": 5, ...}'` if you specifically want DFlash on this hardware.** k=5 trades off 3 of 5 prompt classes (Q&A, JSON, Math) being roughly at master parity, with Code and LongCode hitting peak performance. k=15 — the upstream-recommended setting — costs you 16 tok/s on every prompt class versus k=5. Do NOT use k=15 on a single Spark.
+
+For absolute production speed, **use `master` (MTP-2, 51 tok/s mean)**. The DFlash branch is **−15% to −47%** depending on `num_speculative_tokens`. There's no hardware setting on a single Spark that flips this verdict. The DFlash advantage shows up either at smaller scale (the 27B-DFlash port lands at 5.1× peak — see [`27B_DFLASH_BENCHMARK.md`](27B_DFLASH_BENCHMARK.md)) or on a different runtime (SGLang+DFlash — see [`SGLANG_FEASIBILITY.md`](SGLANG_FEASIBILITY.md), [`SGLANG_SPIKE_35B.md`](SGLANG_SPIKE_35B.md)).
+
+### Community data (dual-Spark, Qwen3.5-122B-A10B-FP8, vLLM)
+
+Independent community measurements on a *different* setup — dual-Spark with Ray TP=2, the official Qwen FP8 checkpoint instead of our INT4-Hybrid, and vLLM without our INT8-LM-Head-v2 patch. Same prompt classes. Median of 2 runs.
+
+| Method                       | Q&A (256 tok) | Code (512 tok) | JSON (1 K) | Math (64 tok) | LongCode (2 K) |
+|---|---:|---:|---:|---:|---:|
+| MTP, k=3                     | 42.3 | 49.4 | 46.6 | 42.3 | 51.5 |
+| **DFlash, k=5**              | **42.1** | **52.3** | **43.0** | **46.7** | **61.3** |
+| DFlash, k=7                  | 39.9 | 55.6 | 36.6 | 52.8 | 49.1 |
+
+The community-data shape (k=5 best, k=7 starts losing on JSON) is consistent with our single-Spark measurement (k=5 ≫ k=15). The absolute numbers differ because the community runs on FP8 instead of INT4-Hybrid and on dual-Spark Ray instead of single-card; the apples-to-apples comparison for our hardware is the previous sub-section, not this one.
+
+### Why vLLM-DFlash didn't win on this hardware — verified hypotheses
+
+1. **Attention backend mismatch (verifier-side).** vLLM 0.20 routes the verifier through `FLASH_ATTN` (FlashAttention 2) when DFlash is active. Master's MTP-2 verifier runs on `FLASHINFER`, which is **+16%** on this hardware (per master's "Optimization 1" measurement). The DFlash drafter requires non-causal masks the FlashInfer prefill kernel does not currently handle, so we have to drop the verifier to FA2 as a side-effect. About 10-15% of the 51→43 gap traces back to this single switch.
+2. **k=15 is verifier-bound at 122B-A10B on single Spark.** With ~10 B active params and MoE routing dominating the per-step cost, the verifier doesn't have enough compute slack to validate 15 draft tokens before the draft becomes stale. Acceptance length collapses (visible in the 23→34 k=15 spread vs the 39→52 k=5 spread). The block-diffusion drafter gives us 15 tokens for free; we just can't ratify them.
+3. **No drafter co-batching.** vLLM 0.20 schedules the drafter forward and the verifier forward as serialized scheduler steps. SGLang's Spec V2 (`SGLANG_ENABLE_SPEC_V2=1`) reportedly overlaps them. The Modal Labs SGLang+DFlash launch on B200 reports +27% from this overlap alone — but the SGLang Spec V2 path requires `fa4 / trtllm_mha` (SM100-only) for the verifier, which is hardware-blocked on SM121 (see [`SGLANG_FEASIBILITY.md`](SGLANG_FEASIBILITY.md)). The Spec V2 + FlashInfer fallback that *would* run on Spark is a 1-2 week port and isn't part of this artifact.
+4. **PR #40898 is unmerged upstream.** The 122B-drafter SWA fix is still under review — our build applies it as a `.diff` cherry-pick and is therefore tied to that PR's revision. If the PR is force-pushed or rebased, the install pipeline may need a `--no-cache` rebuild against the new diff.
+
+### What this branch ships
+
+- `docker/Dockerfile.v2-dflash`, `configs/launch-v2-dflash.sh`, `bench_dflash_sweep.sh`, `install.sh` plumbing — the full vLLM 0.20.0 + #40898 path on top of the same hybrid INT4+FP8 + INT8 LM Head v2 patches as `master`.
+- Two `inc.py` signature compat fixes (`override_quantization_method` and `maybe_update_config` both accept `hf_config=None`) so the hybrid patch works on both vLLM 0.19.x (master) and 0.20.x (this branch).
+- The `master` branch with MTP-2 (51 tok/s, single-Spark) remains the recommended production config. Switch back any time:
+
+  ```bash
+  git checkout master
+  ./install.sh
+  ```
+
+For a deeper investigation of where DFlash *does* outperform on this hardware family, see the sibling artifacts:
+- [`27B_DFLASH_BENCHMARK.md`](27B_DFLASH_BENCHMARK.md) — vLLM-DFlash on Qwen3.5-27B INT4 hits **3.6× steady-state and 5.1× peak** on a single Spark. DFlash's drafting-bandwidth optimization survives there because the verifier is cheap relative to drafting.
+- [`SGLANG_FEASIBILITY.md`](SGLANG_FEASIBILITY.md), [`SGLANG_SPIKE_35B.md`](SGLANG_SPIKE_35B.md) — SGLang+DFlash spike on Qwen3.5-35B-A3B INT4 hits **117 tok/s (+4.6% over master)**. Same caveat: 35B's verifier is cheaper than 122B's, so DFlash gets headroom.
 
 ---
 
@@ -472,74 +557,17 @@ We also developed and benchmarked a **custom CUDA fused kernel** that computes a
 - The current INT4 quantization (Intel AutoRound) was calibrated for standard context lengths. For deeper contexts (>256K), a custom AutoRound calibration would be needed.
 - The 1.4M token KV cache theoretically supports ~1M context, but model quality beyond 256K is unverified.
 
-### TurboQuant Recipes
-
-The `generate_tq_metadata.py` script supports multiple recipes. Choose based on your trade-off between memory, speed, and quality:
-
-| Recipe | K Storage | V Storage | Memory vs fp16 | Outlier Dims | Best For |
-|--------|-----------|-----------|----------------|--------------|----------|
-| `turboquant35` | TQ35 | TQ35 | 4× (128B/head) | 50% K+V same | Default, balanced |
-| `turboquant25` | TQ25 | TQ25 | 5× (108B/head) | 25% K+V same | Maximum compression |
-| `turboquant_asym` | TQ35 | TQ35 | 4× (128B/head) | 50% K≠V disjoint | Better needle retrieval |
-| `turboquant_q8k_tq35v` | int8 | TQ35 | ~2× (258B/head) | K=full, V=50% | Best quality |
-| `turboquant_q8k_tq25v` | int8 | TQ25 | ~2× (258B/head) | K=full, V=25% | Quality + V compression |
-
-**Recipe details:**
-
-- **`turboquant35`** (default): Symmetric 3.5-bit encoding. First 50% of dimensions are high-precision outliers for both K and V. Best balance of compression and quality.
-
-- **`turboquant25`**: More aggressive 2.5-bit encoding. Only 25% of dimensions are high-precision outliers. Higher compression ratio but more reconstruction error.
-
-- **`turboquant_asym`** (Asymmetric): Same storage as TQ35 (128B/head), but K uses the first 50% of dimensions while V uses the last 50%. This disjoint selection decorrelates K and V index sets, improving reconstruction quality for long-context needle-in-haystack tasks without extra memory cost.
-
-- **`turboquant_q8k_tq35v`** (True Asymmetric): K stored as int8 + fp16 scale (258 bytes/head), V stored as TQ35. ~2× memory overhead vs fp16 (vs 4× for symmetric TQ). K's full int8 precision preserves attention score quality, while V's TQ compression reduces the overall footprint. Recovers needle-in-haystack quality to 3/3 at 256K context (vs 0/3 with symmetric TQ35).
-
-- **`turboquant_q8k_tq25v`**: Same as above but V uses TQ25 (25% outlier dims). Same memory as q8k-tq35v, more aggressive V compression.
-
 ### Build & Run (TQ variant)
 
 ```bash
-# Step 1: Generate TQ metadata for each recipe you want to use.
-# Each recipe produces its own metadata file — they are NOT interchangeable.
-# --kv-cache-dtype at runtime must match the recipe used here.
-
-# TQ35 — default, balanced (4x memory reduction)
+# 1. Generate TQ metadata (one-time, places turboquant_kv.json in model dir)
 python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json
+    --model-dir ~/models/qwen35-122b-hybrid-int4fp8
 
-# TQ25 — maximum compression (5x memory reduction, lower quality)
-python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant25 \
-    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json
-
-# turboquant_asym — same memory as TQ35, better long-context needle retrieval
-python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_asym \
-    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json
-
-# turboquant_q8k_tq35v — K=int8, V=TQ35 (best quality, ~2x memory)
-python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_q8k_tq35v \
-    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json
-
-# turboquant_q8k_tq25v — K=int8, V=TQ25 (quality + more V compression, ~2x memory)
-python patches/04-turboquant/generate_tq_metadata.py \
-    --model-dir ~/models/qwen35-122b-hybrid-int4fp8 \
-    --recipe turboquant_q8k_tq25v \
-    --output-path ~/models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json
-
-# Step 2: Build TQ image
+# 2. Build TQ image
 docker build -t vllm-qwen35-v2-tq -f docker/Dockerfile.v2-tq .
 
-# Step 3: Run — --kv-cache-dtype must match the recipe used in Step 1.
-# Each recipe has its own metadata file; using the wrong file causes a startup error.
-# TurboQuant auto-selects TRITON_ATTN backend regardless of other flags.
-
-# TQ35 (default)
+# 3. Run
 docker run -d --name vllm-qwen35-tq \
   --gpus all --net=host -v ~/models:/models \
   vllm-qwen35-v2-tq \
@@ -548,72 +576,20 @@ docker run -d --name vllm-qwen35-tq \
   --max-model-len 262144 --gpu-memory-utilization 0.90 \
   --reasoning-parser qwen3 \
   --kv-cache-dtype turboquant35 --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq35.json \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-
-# TQ25 (maximum compression)
-docker run -d --name vllm-qwen35-tq \
-  --gpus all --net=host -v ~/models:/models \
-  vllm-qwen35-v2-tq \
-  serve /models/qwen35-122b-hybrid-int4fp8 \
-  --served-model-name qwen --port 8000 \
-  --max-model-len 262144 --gpu-memory-utilization 0.90 \
-  --reasoning-parser qwen3 \
-  --kv-cache-dtype turboquant25 --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_tq25.json \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-
-# turboquant_asym (disjoint K/V outlier dims)
-docker run -d --name vllm-qwen35-tq \
-  --gpus all --net=host -v ~/models:/models \
-  vllm-qwen35-v2-tq \
-  serve /models/qwen35-122b-hybrid-int4fp8 \
-  --served-model-name qwen --port 8000 \
-  --max-model-len 262144 --gpu-memory-utilization 0.90 \
-  --reasoning-parser qwen3 \
-  --kv-cache-dtype turboquant_asym --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_asym.json \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-
-# turboquant_q8k_tq35v (K=int8, V=TQ35 — best quality)
-docker run -d --name vllm-qwen35-tq \
-  --gpus all --net=host -v ~/models:/models \
-  vllm-qwen35-v2-tq \
-  serve /models/qwen35-122b-hybrid-int4fp8 \
-  --served-model-name qwen --port 8000 \
-  --max-model-len 262144 --gpu-memory-utilization 0.90 \
-  --reasoning-parser qwen3 \
-  --kv-cache-dtype turboquant_q8k_tq35v --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq35v.json \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
-
-# turboquant_q8k_tq25v (K=int8, V=TQ25 — quality + more V compression)
-docker run -d --name vllm-qwen35-tq \
-  --gpus all --net=host -v ~/models:/models \
-  vllm-qwen35-v2-tq \
-  serve /models/qwen35-122b-hybrid-int4fp8 \
-  --served-model-name qwen --port 8000 \
-  --max-model-len 262144 --gpu-memory-utilization 0.90 \
-  --reasoning-parser qwen3 \
-  --kv-cache-dtype turboquant_q8k_tq25v --enable-turboquant \
-  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv_q8k_tq25v.json \
+  --turboquant-metadata-path /models/qwen35-122b-hybrid-int4fp8/turboquant_kv.json \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 ```
 
 > **First launch is slow (~15-20 min vs ~10 min for v2).** TQ patches modify vLLM internals at startup, and the Triton decode kernels are JIT-compiled on first run. Subsequent launches with cached Triton kernels are faster.
 
-> **Important:** `--kv-cache-dtype` must match the recipe embedded in the metadata file. Each recipe produces its own file (e.g. `turboquant_kv_q8k_tq35v.json` vs `turboquant_kv_q8k_tq25v.json`). Passing the wrong file causes a `ValueError` at startup.
-
-> **Attention Backend:** TurboQuant automatically uses `TRITON_ATTN`. The selector switches to TRITON_ATTN whenever any `turboquant*` dtype is detected — do not pass `--attention-backend FLASHINFER` with TurboQuant, it will fail.
+> **TurboQuant + DFlash is not yet wired up on this branch.** The TQ launch above keeps MTP-2 from `master` because `patches/04-turboquant/` was qualified against vLLM 0.19.1 + MTP only. Combining TurboQuant with DFlash requires re-qualifying the TQ Triton attention path against vLLM 0.20.0 and verifying the DFlash drafter sees correctly-decoded packed K/V — out of scope for this branch.
 
 ### TQ Benchmarks
 
-| Config | tok/s | KV Cache | Concurrent @ 256K | Memory/head | Notes |
-|---|---|---|---|---|---|
-| v2 (standard) | **51** | 355K | 1 | 512B (fp16) | Baseline |
-| v2-tq (TQ35) | 39 (-22%) | 1.4M | 5 | 128B | Best memory efficiency |
-| v2-tq-asym | ~39 | 1.4M | 5 | 128B | Better long-context retrieval |
-| v2-tq-q8k-tq35v | ~35 (-31%) | ~700K | ~3 | 258B | Best quality, 2× memory |
+| Config | tok/s | KV Cache | Concurrent @ 256K |
+|---|---|---|---|
+| v2 (standard) | **51** | 355K | 1 |
+| v2-tq | 39 (-22%) | 1.4M | 5 |
 
 ---
 
@@ -623,11 +599,13 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 
 ### Speculative Decoding
 
-**EAGLE-3** — *+10%, but loses to MTP-2.* EAGLE-3 requires downloading and storing separate draft model weights (~5 GB). MTP-2 uses the built-in MTP head (already in the checkpoint) and is both simpler and faster. Two patches were created for EAGLE-3 integration but ultimately abandoned since MTP-2 wins on every metric.
+**MTP-2 → DFlash** — *Tested, did NOT replace.* MTP-2 (`num_speculative_tokens:2`) on master ships 51 tok/s with ~80 % position-2 acceptance. We hypothesized DFlash's parallel-block-diffusion design would beat that on a single Spark — and built this branch to test. Result: **DFlash on vLLM 0.20 + #40898 lands at 43.4 tok/s mean (k=5), 27.2 tok/s (k=15).** The verifier on 122B-A10B is the bottleneck, the FlashInfer→FlashAttention swap costs ~10-15 % on its own, and `k > 5` doesn't amortize on this hardware. Master MTP-2 stays the production stack; this branch is shipped as a documented working DFlash port for users who specifically want it (see [DFlash Sweep Results](#dflash-sweep-results)).
 
-**KnapSpec Self-Speculative** — *Skipped after analysis.* KnapSpec uses the model itself as a draft by skipping layers. Math showed it's bandwidth-inferior to MTP: the draft forward pass reads ~75% of full model weights, while the MTP head reads only 4.4%. On a bandwidth-bound system like DGX Spark, this makes KnapSpec slower than MTP by design.
+**EAGLE-3** — *+10%, but lost to MTP-2 originally.* EAGLE-3 requires downloading and storing separate draft model weights (~5 GB). MTP-2 used the built-in MTP head (already in the checkpoint) and was both simpler and faster. Two patches were created for EAGLE-3 integration but ultimately abandoned since MTP-2 was strictly better. DFlash on this branch is similar in spirit to EAGLE-3 (external drafter file) but with a smaller drafter (~1 GB shared-weight) — and the empirical result (43.4 vs 51 tok/s) is in the same ballpark as EAGLE-3 was originally.
 
-**MTP-1 → MTP-2** — *MTP-1 replaced, not failed.* MTP-1 (`num_speculative_tokens:1`) gave 38.4 tok/s. MTP-2 (`num_speculative_tokens:2`) gives 51 tok/s with ~80% acceptance rate on position 2. Strictly better — more tokens per step with no quality cost.
+**KnapSpec Self-Speculative** — *Skipped after analysis.* KnapSpec uses the model itself as a draft by skipping layers. Math showed it's bandwidth-inferior to MTP: the draft forward pass reads ~75% of full model weights, while the MTP head reads only 4.4%. On a bandwidth-bound system like DGX Spark, this makes KnapSpec slower than MTP by design. DFlash's drafter weighs ~1 GB BF16 and is bandwidth-cheap by the same logic.
+
+**MTP-1 → MTP-2** — *Historical, kept for reference.* MTP-1 (`num_speculative_tokens:1`) gave 38.4 tok/s. MTP-2 (`num_speculative_tokens:2`) gave 51 tok/s with ~80% acceptance rate on position 2. Strictly better at the time — more tokens per step with no quality cost. Both are obsolete on this branch.
 
 ### Expert-Level Optimizations
 
@@ -674,20 +652,22 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 - **ISA:** Same `mma.sync` as SM80 (Ampere). No datacenter-only tensor core instructions.
 - **No native FP4:** FP4 tensor core ops are SM100/SM103 only (datacenter Blackwell).
 - **Memory-bound at batch=1:** 273 GB/s LPDDR5x is the ceiling.
-- **FlashInfer wins:** +16% over FlashAttention2. Always use `--attention-backend FLASHINFER`.
+- **FlashInfer for the verifier, FlashAttention for DFlash:** FlashInfer is +16 % over FlashAttention on the verifier path (the master MTP build pinned this), but the DFlash drafter requires non-causal attention masks that the FlashInfer prefill kernel does not support. On this branch we use `--attention-backend FLASH_ATTN` so the drafter works correctly; the verifier runs on FlashAttention rather than FlashInfer, which is the headline cost of switching from MTP to DFlash. **Empirically this swap accounts for roughly 10-15 % of the 51 → 43 tok/s gap we measured.** The remaining gap traces to the verifier becoming the bottleneck at 122B-A10B once the drafter starts proposing 5+ tokens at a time.
 
 ---
 
 ## Competitive Landscape (April 2026)
 
-| Setup | tok/s | vs Ours |
+| Setup | tok/s | vs Master |
 |---|---|---|
-| **This work (v2)** | **51** | -- |
-| Previous best (v1, MTP-1 + Hybrid) | 38.4 | -25% |
-| Intel AutoRound INT4 (vLLM, FlashInfer) | 28.3 | -45% |
-| llama.cpp GGUF Q5_K | 23.0 | -55% |
-| NVFP4 RedHatAI (vLLM) | 16.6 | -67% |
-| Official Qwen GPTQ-Int4 (vLLM) | 15.0 | -71% |
+| **Master (v2, MTP-2)** | **51** | -- |
+| **This branch (DFlash, k=5)** | **43.4** | **−15%** |
+| **This branch (DFlash, k=15 — upstream default)** | 27.2 | −47% |
+| Previous best (v1, MTP-1 + Hybrid) | 38.4 | −25% |
+| Intel AutoRound INT4 (vLLM, FlashInfer) | 28.3 | −45% |
+| llama.cpp GGUF Q5_K | 23.0 | −55% |
+| NVFP4 RedHatAI (vLLM) | 16.6 | −67% |
+| Official Qwen GPTQ-Int4 (vLLM) | 15.0 | −71% |
 
 ---
 
@@ -725,13 +705,21 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 │           ├── lab_2_perf.py                # Performance benchmark
 │           └── lab_2_tq_fused_bench.py      # Full benchmark suite
 ├── docker/
-│   ├── Dockerfile.v2                        # Main: vLLM + hybrid + INT8 LM Head (baked in)
-│   └── Dockerfile.v2-tq                     # Optional: + TurboQuant (baked in)
-└── configs/
-    ├── launch-baseline.sh                   # 28.3 tok/s (reference)
-    ├── launch-hybrid.sh                     # 30.8 tok/s (hybrid only)
-    ├── launch-v2.sh                         # 51 tok/s (production)
-    └── launch-v2-tq.sh                     # 39 tok/s (TQ variant)
+│   ├── Dockerfile.v2                        # master: vLLM 0.19 + hybrid + INT8 LM Head + MTP
+│   ├── Dockerfile.v2-dflash                 # this branch: vLLM 0.20 + hybrid + INT8 LM Head + DFlash
+│   └── Dockerfile.v2-tq                     # Optional: + TurboQuant (master/MTP only for now)
+├── configs/
+│   ├── launch-baseline.sh                   # 28.3 tok/s (reference)
+│   ├── launch-hybrid.sh                     # 30.8 tok/s (hybrid only)
+│   ├── launch-v2.sh                         # 51 tok/s (master, MTP-2)
+│   ├── launch-v2-dflash.sh                  # this branch (DFlash, k=5 recommended)
+│   └── launch-v2-tq.sh                      # 39 tok/s (TQ + MTP variant, master)
+├── results/
+│   └── dflash-bench-122b-actual.txt         # this branch's measured numbers (k=5, k=15)
+├── bench_dflash_sweep.sh                    # Sweep num_speculative_tokens ∈ {2..15}
+├── 27B_DFLASH_BENCHMARK.md                  # vLLM-DFlash on Qwen3.5-27B (3.6× steady, 5.1× peak)
+├── SGLANG_FEASIBILITY.md                    # SGLang+DFlash on DGX Spark — what survives, what doesn't
+└── SGLANG_SPIKE_35B.md                      # SGLang+DFlash on Qwen3.5-35B-A3B INT4 (+4.6% vs master)
 ```
 
 ## Acknowledgments
@@ -743,6 +731,9 @@ We tested 20+ optimization approaches across speculative decoding, quantization,
 - [bjk110/spark_vllm_docker](https://github.com/bjk110/spark_vllm_docker/tree/feat/turboquant) for the original TurboQuant SM121 adaptation and CUDA WPH kernel
 - [Google Research — TurboQuant](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) for the KV cache compression algorithm (ICLR 2026)
 - [0xSero/turboquant](https://github.com/0xSero/turboquant) for Triton kernel reference implementation
+- [z-lab/dflash](https://github.com/z-lab/dflash) for the DFlash speculative decoding algorithm and the [Qwen3.5-122B-A10B-DFlash](https://huggingface.co/z-lab/Qwen3.5-122B-A10B-DFlash) drafter weights
+- [AEON-7/vllm-dflash](https://github.com/AEON-7/vllm-dflash) for the prior-art DGX Spark + DFlash docker setup that informed this integration
+- [vLLM PR #40898](https://github.com/vllm-project/vllm/pull/40898) (interleaved-SWA support for the 122B drafter, includes the target_layer_ids+1 fix originally in PR [#40727](https://github.com/vllm-project/vllm/pull/40727)) — required to load the 122B drafter correctly
 - [vLLM](https://github.com/vllm-project/vllm) for the inference engine
 - [NVIDIA Developer Forums](https://forums.developer.nvidia.com/t/365639) DGX Spark community for testing and feedback
 

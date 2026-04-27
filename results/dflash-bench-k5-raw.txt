@@ -1,0 +1,20 @@
+╔══════════════════════════════════════════════════════╗
+║  Qwen3.5-122B-A10B Benchmark: v2-dflash-k5-122b
+║  Mon Apr 27 10:20:03 PM EEST 2026
+╚══════════════════════════════════════════════════════╝
+
+── Run 1/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 58.42s = 4.3 tok/s (prompt: 23)
+  [Code] 501 tokens in 9.92s = 50.5 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 25.08s = 40.8 tok/s (prompt: 48)
+  [Math] 64 tokens in 1.65s = 38.7 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 40.13s = 51.0 tok/s (prompt: 37)
+
+── Run 2/2 ──────────────────────────────────────
+  [Q&A] 256 tokens in 6.54s = 39.1 tok/s (prompt: 23)
+  [Code] 498 tokens in 10.14s = 49.1 tok/s (prompt: 30)
+  [JSON] 1024 tokens in 26.27s = 38.9 tok/s (prompt: 48)
+  [Math] 64 tokens in 1.66s = 38.5 tok/s (prompt: 29)
+  [LongCode] 2048 tokens in 39.68s = 51.6 tok/s (prompt: 37)
+
+=== Done ===
