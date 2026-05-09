@@ -18,8 +18,18 @@
 # Flags:
 #   --no-cache       Force a clean rebuild: removes existing vllm-sm121 and
 #                    vllm-qwen35-v2 images, prunes BuildKit cache, then runs
-#                    Steps 3 & 4 from scratch. Use if a previous failed build
-#                    left stale BuildKit layers. Adds 30-60 min.
+#                    Steps 3 & 4 from scratch. Use this if you previously built
+#                    `vllm-sm121:latest` BEFORE PR #38325 was the default and
+#                    want to upgrade to the new patched base (~30-60 min cost).
+#                    Also use if a previous failed build left stale layers.
+#   --no-pr38325     SKIP the vLLM PR #38325 cherry-pick (swapAB SM120 CUTLASS
+#                    blockwise FP8 GEMM). Default IS to apply PR #38325 — it
+#                    gives ~+0.76% throughput on shared_expert decode and adds
+#                    no extra build time on a fresh install (vLLM is rebuilt
+#                    from source for SM121 either way). Use --no-pr38325 only
+#                    if the patch breaks your build, or you want to reuse an
+#                    existing pristine `vllm-sm121:latest` cache without the
+#                    full ~30-60 min NVCC recompile.
 #   --launch         After build, automatically launch the container (Step 5).
 #                    Default: prompts interactively. With --launch, no prompt.
 #   --no-launch      Never launch, never prompt. Useful for CI / unattended runs.
@@ -52,19 +62,36 @@ TORCHAUDIO_VERSION="2.11.0.dev${TORCH_NIGHTLY_DATE}+cu130"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 NO_CACHE=0
+WITH_PR38325=1   # default ON since 2026-05-09 — PR #38325 gives ~+0.76% with
+                 # zero extra build time on fresh installs (vLLM is rebuilt
+                 # for SM121 either way). Set to 0 with --no-pr38325 to skip.
 LAUNCH_MODE="prompt"   # prompt | yes | no
 for arg in "$@"; do
     case "$arg" in
-        --no-cache)  NO_CACHE=1 ;;
-        --launch)    LAUNCH_MODE="yes" ;;
-        --no-launch) LAUNCH_MODE="no" ;;
+        --no-cache)     NO_CACHE=1 ;;
+        --no-pr38325)   WITH_PR38325=0 ;;
+        --launch)       LAUNCH_MODE="yes" ;;
+        --no-launch)    LAUNCH_MODE="no" ;;
         -h|--help)
-            sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
+            sed -n '2,40p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'
             exit 0
             ;;
         *) echo "unknown flag: $arg (use --help)" >&2; exit 2 ;;
     esac
 done
+
+# Single image name regardless of PR choice — the patch is baked INTO
+# vllm-sm121:latest (default) or omitted if --no-pr38325. The same name
+# is used either way, so existing callers (`docker run vllm-qwen35-v2 ...`)
+# don't change. Existing users with a pre-PR vllm-sm121:latest cached must
+# pass --no-cache to actually rebuild and pick up PR #38325.
+SM121_IMAGE="vllm-sm121"
+if [ "$WITH_PR38325" = 1 ]; then
+    PR38325_DIFF="${PROJECT_DIR}/patches/05-pr38325-swapab/pr38325-swapab-fp8-sm120.diff"
+    [ -f "$PR38325_DIFF" ] || { echo "FAIL: PR #38325 diff missing at $PR38325_DIFF (use --no-pr38325 to skip)" >&2; exit 1; }
+else
+    PR38325_DIFF=""
+fi
 
 # ── Pretty output ─────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -295,18 +322,27 @@ fi
 if [ "$NO_CACHE" = "1" ]; then
     log "${C_YEL}--no-cache: removing existing images and pruning BuildKit cache${C_OFF}"
     docker rmi -f vllm-qwen35-v2:latest 2>/dev/null || true
-    docker rmi -f vllm-sm121:latest    2>/dev/null || true
+    docker rmi -f "${SM121_IMAGE}:latest" 2>/dev/null || true
     docker builder prune -af >/dev/null 2>&1 || true
     note "all stale layers gone — Step 3 will rebuild from scratch"
 fi
 
-# ── Step 3: build vllm-sm121 ──────────────────────────────────────────────────
-if docker image inspect vllm-sm121:latest >/dev/null 2>&1; then
+# ── Step 3: build ${SM121_IMAGE} ─────────────────────────────────────────────
+if docker image inspect "${SM121_IMAGE}:latest" >/dev/null 2>&1; then
     STEP_NUM=$((STEP_NUM + 1))
-    step_skip "Step 3 — vllm-sm121:latest already exists (delete with 'docker rmi vllm-sm121' to rebuild, or pass --no-cache)"
+    if [ "$WITH_PR38325" = 1 ]; then
+        step_skip "Step 3 — ${SM121_IMAGE}:latest already exists (cached). NOTE: if your cached image was built BEFORE PR #38325 became default, pass --no-cache to rebuild and pick it up. Or pass --no-pr38325 to skip PR #38325 and reuse the cache as-is."
+    else
+        step_skip "Step 3 — ${SM121_IMAGE}:latest already exists. --no-pr38325 set, no PR #38325 expected in this image."
+    fi
 else
-    step_begin "Step 3 — Building vllm-sm121 base image for SM121" \
-               "first build: ~30-60 min (compiles vLLM, FlashInfer, NCCL for SM121); cached: ~3 min"
+    if [ "$WITH_PR38325" = 1 ]; then
+        step_begin "Step 3 — Building ${SM121_IMAGE} base image for SM121 (with PR #38325)" \
+                   "first build: ~30-60 min; cached: ~3 min. PR #38325 adds swapAB FP8 SM120 GEMM (~+0.76% on shared_expert decode, baked into the base by default)."
+    else
+        step_begin "Step 3 — Building ${SM121_IMAGE} base image for SM121 (vanilla, --no-pr38325)" \
+                   "first build: ~30-60 min (compiles vLLM, FlashInfer, NCCL for SM121); cached: ~3 min. PR #38325 NOT applied per --no-pr38325."
+    fi
 
     # Clone or refresh upstream
     if [ ! -d "${SPARK_VLLM_DIR}/.git" ]; then
@@ -368,6 +404,39 @@ else
             "${SPARK_VLLM_DIR}/Dockerfile"
     fi
 
+    # Optional: cherry-pick vLLM PR #38325 (swapAB SM120 CUTLASS blockwise FP8
+    # GEMM). Single .cuh; SM121 explicitly in scope. Auto-active in decode path
+    # (M ≤ 64). Measured +0.76% throughput on Qwen3.5-122B/Spark, cumulative
+    # +2.0% over baseline when combined with autotune. The diff was rewritten
+    # for v0.19.0 source paths (csrc/quantization/... not csrc/libtorch_stable/...
+    # and torch::Tensor not torch::stable::Tensor) — see README and the file
+    # `patches/05-pr38325-swapab/pr38325-swapab-fp8-sm120.diff`.
+    if [ "$WITH_PR38325" = 1 ]; then
+        cp "${PR38325_DIFF}" "${SPARK_VLLM_DIR}/local-pr38325.diff"
+        if ! grep -q 'local-pr38325.diff' "${SPARK_VLLM_DIR}/Dockerfile"; then
+            python3 - "${SPARK_VLLM_DIR}/Dockerfile" <<'PYEOF'
+import re, sys
+path = sys.argv[1]
+txt = open(path).read()
+inject = (
+    '\nCOPY local-pr38325.diff /tmp/local-pr38325.diff\n'
+    'RUN echo "=== applying PR #38325 (swapAB FP8 SM120) ===" \\\n'
+    '    && git apply -v /tmp/local-pr38325.diff \\\n'
+    '    && rm /tmp/local-pr38325.diff\n'
+)
+pat = r'(RUN if \[ -n "\$VLLM_PRS" \]; then.*?    fi\n)'
+new_txt, n = re.subn(pat, r'\1' + inject, txt, count=1, flags=re.DOTALL)
+if n != 1:
+    print("FAIL: VLLM_PRS anchor not found in Dockerfile, can't inject PR #38325", file=sys.stderr)
+    sys.exit(1)
+open(path, 'w').write(new_txt)
+PYEOF
+        fi
+        grep -q 'local-pr38325.diff' "${SPARK_VLLM_DIR}/Dockerfile" \
+            || abort "PR #38325 inject did not land in Dockerfile."
+        note "PR #38325 (swapAB FP8 SM120) will be applied during vLLM build"
+    fi
+
     # Build (must use build-and-copy.sh, not bare 'docker build', because the
     # upstream Dockerfile COPYs build-metadata.yaml which the script generates
     # at build time and removes on exit). --vllm-ref v0.19.0 + --tf5 are not
@@ -377,11 +446,11 @@ else
     # was passed to install.sh).
     (
         cd "${SPARK_VLLM_DIR}"
-        ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5 2>&1
+        ./build-and-copy.sh -t "${SM121_IMAGE}" --vllm-ref v0.19.0 --tf5 2>&1
     )
 
-    docker image inspect vllm-sm121:latest >/dev/null 2>&1 \
-        || abort "vllm-sm121:latest is not in 'docker images' after build-and-copy.sh — something failed silently."
+    docker image inspect "${SM121_IMAGE}:latest" >/dev/null 2>&1 \
+        || abort "${SM121_IMAGE}:latest is not in 'docker images' after build-and-copy.sh — something failed silently."
     step_end
 fi
 
@@ -391,9 +460,15 @@ if docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1; then
     step_skip "Step 4 — vllm-qwen35-v2:latest already exists (delete with 'docker rmi vllm-qwen35-v2' to rebuild, or pass --no-cache)"
 else
     step_begin "Step 4 — Building vllm-qwen35-v2 (final image)" \
-               "thin layer on top of vllm-sm121: copies hybrid INC patch and bakes INT8 LM Head v2 patch"
+               "thin layer on top of ${SM121_IMAGE}:latest: copies hybrid INC patch and bakes INT8 LM Head v2 patch (with autotune). ~1 sec."
     cd "${PROJECT_DIR}"
-    docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
+    # VLLM_BASE always vllm-sm121:latest in normal install.sh flow. Kept as
+    # a build-arg so a manual `docker build` can override when testing
+    # alternative base images (e.g., comparison runs against archived tags).
+    docker build \
+        --build-arg "VLLM_BASE=${SM121_IMAGE}:latest" \
+        -t vllm-qwen35-v2 \
+        -f docker/Dockerfile.v2 .
     docker image inspect vllm-qwen35-v2:latest >/dev/null 2>&1 \
         || abort "vllm-qwen35-v2:latest is not in 'docker images' after build."
     step_end
@@ -407,8 +482,8 @@ ok "All build steps complete in $(fmt_time $TOTAL)"
 echo "${C_GRN}════════════════════════════════════════════════════════════════════${C_OFF}"
 echo
 log "Images:"
-docker images vllm-sm121     --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
-docker images vllm-qwen35-v2 --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
+docker images "${SM121_IMAGE}" --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
+docker images vllm-qwen35-v2  --format '   {{.Repository}}:{{.Tag}}   {{.Size}}' | grep -v '^$' || true
 echo
 log "Model:"
 echo "   ${MODEL_DIR}"

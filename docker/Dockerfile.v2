@@ -22,10 +22,17 @@
 #     --reasoning-parser qwen3 --attention-backend FLASHINFER \
 #     --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
 
-# Base: vLLM 0.19.1 compiled for SM121 (built in Step 3 of README)
-# Tested build: 0.19.1.dev0+g2a69949bd (commit 2a69949bd, 2026-04-04)
+# Base: vLLM 0.19.1 compiled for SM121 (built in Step 3 of README via install.sh).
+# Tested build: 0.19.1.dev0+g2a69949bd (commit 2a69949bd, 2026-04-04).
 # WARNING: Do NOT use other vLLM versions without re-testing patches.
-FROM vllm-sm121:latest
+#
+# Default base is `vllm-sm121:latest` (the standard install.sh build).
+# Optional override: `docker build --build-arg VLLM_BASE=vllm-sm121-pr38325:latest ...`
+# uses the variant base built via `install.sh --with-pr38325`, which adds vLLM
+# PR #38325 (swapAB SM120 CUTLASS blockwise FP8 GEMM) for an extra +0.76% on
+# shared_expert decode (cumulative +2.0% over baseline vs autotune-only).
+ARG VLLM_BASE=vllm-sm121:latest
+FROM ${VLLM_BASE}
 
 # Patch 1: Hybrid INT4+FP8 dispatch for shared expert dense layers
 COPY patches/01-hybrid-int4-fp8/inc.py \

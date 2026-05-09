@@ -1,13 +1,13 @@
-# Qwen3.5-122B-A10B on DGX Spark: 28.3 → 51 tok/s (+80%)
+# Qwen3.5-122B-A10B on DGX Spark: 28.3 → 52 tok/s (+82%)
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Performance](https://img.shields.io/badge/tok%2Fs-51-brightgreen?style=flat&logo=speedtest&logoColor=white)](.)
+[![Performance](https://img.shields.io/badge/tok%2Fs-52-brightgreen?style=flat&logo=speedtest&logoColor=white)](.)
 [![Qwen3.5-35B](https://img.shields.io/badge/Qwen3.5--35B-112_tok%2Fs-00cc44?style=flat&logo=speedtest&logoColor=white)](.)
-[![Speedup](https://img.shields.io/badge/speedup-%2B80%25-orange?style=flat)](.)
+[![Speedup](https://img.shields.io/badge/speedup-%2B82%25-orange?style=flat)](.)
 [![Hardware](https://img.shields.io/badge/NVIDIA-DGX_Spark-76B900?style=flat&logo=nvidia&logoColor=white)](https://www.nvidia.com/en-us/products/workstations/dgx-spark/)
 [![Model](https://img.shields.io/badge/%F0%9F%A4%97-Qwen3.5--122B--A10B-yellow)](https://huggingface.co/Qwen/Qwen3.5-122B-A10B)
 [![Quantization](https://img.shields.io/badge/Quant-INT4%2BFP8_Hybrid-purple)](https://huggingface.co/Intel/Qwen3.5-122B-A10B-int4-AutoRound)
-[![INT8 LM Head](https://img.shields.io/badge/LM_Head-INT8_Triton-blueviolet?style=flat)](.)
+[![INT8 LM Head](https://img.shields.io/badge/LM_Head-INT8_Triton%20%2B%20Autotune-blueviolet?style=flat)](.)
 [![MTP-2](https://img.shields.io/badge/MTP--2-~80%25_accept-ff69b4?style=flat)](.)
 [![Context](https://img.shields.io/badge/Context-256K-blue?style=flat)](.)
 [![TurboQuant](https://img.shields.io/badge/TQ-4x_KV_cache-cyan?style=flat)](.)
@@ -15,7 +15,7 @@
 [![CUDA](https://img.shields.io/badge/CUDA-13.0-green?style=flat&logo=nvidia)](.)
 [![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker&logoColor=white)](docker/Dockerfile.v2)
 
-Optimizations for Qwen3.5-122B-A10B inference on a single NVIDIA DGX Spark from **28.3 to 51 tok/s** (+80%), with 256K context support, no quality degradation.
+Optimizations for Qwen3.5-122B-A10B inference on a single NVIDIA DGX Spark from **28.3 to 52 tok/s** (+82%), with 256K context support, no quality degradation. Headline 52 = round of 51.6 tok/s cross-prompt average measured 2026-05-09 on v2.4 (autotune + PR #38325, both default-on); LongCode peak 54.9 tok/s.
 
 ## Results
 
@@ -25,9 +25,24 @@ Optimizations for Qwen3.5-122B-A10B inference on a single NVIDIA DGX Spark from 
 | + Hybrid INT4+FP8 Dense Layers | **30.8** | +8.8% | step 1 |
 | + MTP-2 Speculative Decoding | **38.4** | +35.7% | step 2 |
 | **v2** (+ INT8 LM Head v2) | **51** | **+80%** | **`Dockerfile.v2`** |
+| **v2.4** (+ `@triton.autotune` on LM Head + vLLM PR #38325 swapAB FP8 SM120, both default-on since 2026-05-09) | **52** (54.9 LongCode peak) | **+82%** | `./install.sh` (default) |
 | v2-tq (+ TurboQuant KV Cache) | 39 | +38% | `Dockerfile.v2-tq` |
 
 The same optimizations also work with Qwen3.5-35B-A3B (same architecture, smaller): **112 tok/s**.
+
+> **About the v2.4 numbers** (5 runs × 2 sub-runs = 10 sub-runs, n=50 prompt measurements, `bench_qwen35.sh` 2026-05-09):
+>
+> | Prompt | Mean | Median | Std |
+> |---|---:|---:|---:|
+> | Q&A 256       | 51.3 | 51.3 | 0.70 |
+> | Code 512      | 52.8 | 52.9 | 0.23 |
+> | JSON 1024     | 51.1 | 51.2 | 0.78 |
+> | Math 64       | 47.8 | 48.1 | 0.81 |
+> | LongCode 2048 | **54.9** | 55.0 | 0.31 |
+>
+> Cross-prompt mean of per-sub-run averages: **51.58 ± 0.30 tok/s**. Headline 52 = round(51.58); LongCode 54.9 reflects the most decode-bound prompt (long sustained generation) where LM Head + shared_expert FP8 paths dominate.
+>
+> Composition: wonderwork v2 (canonical 51) + `@triton.autotune` (+1.2% A/B) + vLLM PR #38325 swapAB FP8 SM120 (+0.76% marginal A/B). The +1.1% headline gain (51 → 51.6) is at ~1.5σ of bench noise; the per-prompt deltas (especially LongCode 54.2 → 54.9 and Code 52.0 → 52.8) are above noise individually. See [Optimization 4](#optimization-4-int8-lm-head-v2) for autotune details and [Optimization 5](#optimization-5-vllm-pr-38325-swapab-sm120-fp8-gemm) for PR #38325.
 
 ### 256K Context Support
 
@@ -47,7 +62,13 @@ All optimizations are independent — pick what you need:
 | Path | Steps | tok/s | What you get |
 |---|---|---|---|
 | **MTP only** (easiest) | 0 → 2 → 3 → 4 → 5 | ~44 | MTP-2 + INT8 LM Head, no hybrid |
-| **Full v2** (recommended) | 0 → 1 → 2 → 3 → 4 → 5 | **51** | All optimizations |
+| **Full v2.4** (recommended, default) | 0 → 1 → 2 → 3 → 4 → 5 | **52** (54.9 LongCode peak) | All wonderwork v2 optimizations + LM-Head `@triton.autotune` + vLLM PR #38325 swapAB FP8 SM120 cherry-pick (both default-on since 2026-05-09). |
+
+> **First-time builds take ~30-60 min** because vLLM has no prebuilt SM121 wheels — Step 3 NVCC-compiles the entire vLLM C extension. PR #38325 is baked into that build at zero extra time cost. Subsequent re-runs of `install.sh` skip Step 3 if the image is cached (~3 min total).
+>
+> **Existing users (cached `vllm-sm121:latest` from before PR #38325 became default):** the cache check skips Step 3, so you keep your old base and miss the +0.76%. To pick up PR #38325, pass `--no-cache` (full rebuild, ~30-60 min) or run `docker rmi vllm-sm121:latest` and re-run `install.sh`.
+>
+> **Need vanilla (no PR #38325)?** Pass `--no-pr38325` — useful if the patch breaks your build, or you want to keep a pristine `vllm-sm121:latest` cache. You'll only lose the marginal +0.76% (autotune still applies).
 
 ### Automated install (TL;DR)
 
@@ -64,11 +85,17 @@ The script never invokes `sudo` itself: if a prerequisite is missing (`python3-v
 Useful flags:
 
 ```bash
-./install.sh --launch       # build, then auto-launch container (no prompt)
-./install.sh --no-launch    # build only, never prompt for launch
-./install.sh --no-cache     # nuke existing images + BuildKit cache and rebuild
-                            # from scratch (use after a previous failed build)
-./install.sh --help         # full flag reference
+./install.sh --launch        # build, then auto-launch container (no prompt)
+./install.sh --no-launch     # build only, never prompt for launch
+./install.sh --no-cache      # nuke existing images + BuildKit cache and rebuild
+                             # from scratch. Required for existing users whose
+                             # cached vllm-sm121:latest predates PR #38325 default.
+./install.sh --no-pr38325    # SKIP the PR #38325 swapAB FP8 cherry-pick (default
+                             # IS to apply it). Use only if the patch breaks your
+                             # build or you want to reuse a pristine vllm-sm121
+                             # cache without the ~30-60 min recompile. Costs the
+                             # +0.76% marginal contribution from PR #38325.
+./install.sh --help          # full flag reference
 ```
 
 If you prefer to do it step-by-step manually (or want to understand what the script does), follow Steps 0-4 below — the script runs exactly the same commands.
@@ -143,6 +170,7 @@ python patches/02-mtp-speculative/add-mtp-weights.py \
 DGX Spark requires vLLM compiled for SM121 (Blackwell). Pre-built wheels from PyPI don't support this architecture. Use [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) at the exact commit we tested against:
 
 ```bash
+PROJECT_DIR=$(pwd)   # path to this repo (DGX_Spark_Qwen3.5-122B-A10B-AR-INT4)
 git clone https://github.com/eugr/spark-vllm-docker.git
 cd spark-vllm-docker
 git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
@@ -164,6 +192,19 @@ sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Docker
 # at startup (PyTorch changed the signature of at::cuda::getCurrentCUDABlasHandle
 # between nightlies, so vllm/_C.abi3.so and libtorch_cuda.so disagree).
 sed -i 's|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130|g' Dockerfile
+
+# Cherry-pick vLLM PR #38325 (swapAB SM120 CUTLASS blockwise FP8 GEMM)
+# — adds ~+0.76% throughput on shared_expert decode. SKIP this if you want
+# vanilla vLLM (run the docker build with --build-arg VLLM_BASE=vllm-sm121:latest
+# in Step 4 in either case; the same final tag is used).
+cp "${PROJECT_DIR}/patches/05-pr38325-swapab/pr38325-swapab-fp8-sm120.diff" local-pr38325.diff
+python3 -c "
+import re
+txt = open('Dockerfile').read()
+inject = '\nCOPY local-pr38325.diff /tmp/local-pr38325.diff\nRUN git apply -v /tmp/local-pr38325.diff && rm /tmp/local-pr38325.diff\n'
+new_txt = re.sub(r'(RUN if \[ -n \"\\\$VLLM_PRS\" \]; then.*?    fi\n)', r'\1' + inject, txt, count=1, flags=re.DOTALL)
+open('Dockerfile', 'w').write(new_txt)
+"
 
 ./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
 cd ..
@@ -189,6 +230,8 @@ This takes 30-60 minutes (compiles PyTorch + FlashInfer + Triton for SM121).
 docker build -t vllm-qwen35-v2 -f docker/Dockerfile.v2 .
 ```
 
+This is a ~1-second thin layer on top of `vllm-sm121:latest` that COPYs `patches/01-hybrid-int4-fp8/inc.py` into the image and runs `patches/03-int8-lm-head/patch_int8_lmhead.py` to text-replace `vllm/model_executor/layers/logits_processor.py` with the INT8 LM Head v2 + autotune kernel. To layer on a different base (e.g. a vanilla `vllm-sm121:latest` you built without PR #38325), pass `--build-arg VLLM_BASE=<image-name>:<tag>`.
+
 ### Step 5: Launch
 
 ```bash
@@ -208,7 +251,7 @@ docker run -d --name vllm-qwen35 \
 
 > If you skipped step 1, replace the model path with your Intel AutoRound directory.
 
-Wait ~10 minutes for loading + warmup. Then:
+Wait ~13 minutes for loading + warmup (weights load ~10 min + compile/warmup ~2.5 min + graph capture ~30s; cached re-launches drop to 5-7 min). Then:
 
 ```bash
 curl localhost:8000/health
@@ -293,7 +336,7 @@ For Qwen3.5-122B (this project), use `--tool-call-parser qwen3_xml`. The example
 
 | Symptom | Fix |
 |---|---|
-| `health` returns nothing | Wait. It takes 10 minutes to load. |
+| `health` returns nothing | Wait. It takes ~13 min on first launch (weights load ~10 min + compile/warmup ~2.5 min + graph capture ~30s). Cached re-launches: ~5-7 min. |
 | Garbage output | Ensure patched image, not vanilla vLLM |
 | OOM at startup | Lower `--gpu-memory-utilization` to 0.85 |
 | `content: null` | Normal for thinking models. Response is in `reasoning` field. |
@@ -330,6 +373,8 @@ These exact versions were used for all benchmarks. Mismatched versions may cause
 | **Python** | 3.12.3 |
 | **OS** | Ubuntu 24.04.4 LTS (aarch64) |
 | **Build flags** | `TORCH_CUDA_ARCH_LIST=12.1a` `FLASHINFER_CUDA_ARCH_LIST=12.1a` |
+| **Repo HEAD** | master tip — `bd16c23` (autotune default-on, +1.2%), `daf7d34` (PR #38325 plumbing), and the default-on flip. Bake order: wonderwork v2 (`4b0f284`) → autotune → PR #38325 baked into `vllm-sm121:latest` build. |
+| **Anchors back-out** | `--no-pr38325` rebuilds without PR #38325 (loses +0.76%, keeps autotune); ad-hoc reverts of `bd16c23` are possible but not exposed as a flag (autotune is byte-identical arithmetic, no quality risk) |
 
 > **Why all three torch packages are pinned to the same date:** PyTorch, torchvision, and torchaudio are released together every night but are separate packages on the nightly index. The eugr base image installs all three via `uv pip install torch torchvision torchaudio triton ...` in two different build stages. Without an explicit pin, the two invocations can land on different nightlies (e.g., builder pulls `dev20260411` while runner pulls `dev20260412`), which bakes an ABI mismatch into the final image — the vLLM C extension ends up linked against a torch that no longer exports the symbols it was compiled against. `install.sh` enforces the pin automatically; a manual build must reproduce the `sed` command in Step 3.
 
@@ -339,23 +384,11 @@ These exact versions were used for all benchmarks. Mismatched versions may cause
 - [Intel/Qwen3.5-122B-A10B-int4-AutoRound](https://huggingface.co/Intel/Qwen3.5-122B-A10B-int4-AutoRound)
 - [Qwen/Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8) (FP8 source for dense layers, optional if skipping hybrid)
 
-### Building vLLM 0.19 for SM121 (DGX Spark)
+### Building vLLM 0.19 for SM121 (DGX Spark) — env vars / community mod reference
 
-DGX Spark uses the GB10 GPU (SM121 / Blackwell). vLLM doesn't ship pre-built images for this architecture, so you need to compile from source. The recommended approach is [eugr/spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) which handles all SM121 specifics. Use the exact commit we tested against — upstream Dockerfiles change frequently:
+For the actual build commands and rationale, see [Step 3 above](#step-3-build-base-vllm-image-for-sm121). This section just summarizes the SM121-specific build settings and one community alternative, both of which Step 3 implicitly covers.
 
-```bash
-git clone https://github.com/eugr/spark-vllm-docker.git
-cd spark-vllm-docker
-git checkout 49d6d9fefd7cd05e63af8b28e4b514e9d30d249f
-sed -i '/# TEMPORARY PATCH for broken FP8 kernels/,/&& rm pr35568.diff/d' Dockerfile
-sed -i '/# TEMPORARY PATCH for broken compilation/,/&& rm pr38919.diff/d' Dockerfile
-sed -i 's|uv pip install torch torchvision torchaudio triton --index-url https://download.pytorch.org/whl/nightly/cu130|uv pip install torch==2.12.0.dev20260408+cu130 torchvision==0.27.0.dev20260408+cu130 torchaudio==2.11.0.dev20260408+cu130 triton --index-url https://download.pytorch.org/whl/nightly/cu130|g' Dockerfile
-./build-and-copy.sh -t vllm-sm121 --vllm-ref v0.19.0 --tf5
-```
-
-Do not run `docker build` directly — the upstream Dockerfile `COPY`s a `build-metadata.yaml` file that only exists transiently during `build-and-copy.sh`. The first two `sed` commands strip upstream "TEMPORARY PATCH" RUN blocks that curl-fetch vLLM PRs 35568 and 38919 from live GitHub URLs; those PRs target main-branch bugs that don't apply to `v0.19.0`, and both were force-pushed after 2026-04-04. The third `sed` pins `torch`, `torchvision`, and `torchaudio` in both `pip install` stages of the upstream Dockerfile to the exact nightly date baked into our reference image — without this pin, the builder and runner stages can resolve to different nightlies and produce an ABI mismatch between `vllm/_C.abi3.so` and `libtorch_cuda.so` (symptom: `undefined symbol: _ZN2at4cuda24getCurrentCUDABlasHandleEv` at startup). The flags `--vllm-ref v0.19.0` and `--tf5` match the `build_args` recorded inside our reference image (`vllm_ref: v0.19.0`, `transformers_5: true`).
-
-If building manually, the critical environment variables are:
+The critical compile-time env vars are:
 
 ```bash
 TORCH_CUDA_ARCH_LIST="12.1a"        # SM121 (Blackwell consumer)
@@ -363,11 +396,9 @@ FLASHINFER_CUDA_ARCH_LIST="12.1a"   # FlashInfer kernels for SM121
 CUDA_HOME=/usr/local/cuda-13.0      # or 13.2
 ```
 
-The base CUDA image should be `nvidia/cuda:13.2.0-devel-ubuntu24.04` (aarch64). Build takes 30-60 minutes on DGX Spark.
+The base CUDA image should be `nvidia/cuda:13.2.0-devel-ubuntu24.04` (aarch64). Build takes 30-60 minutes on DGX Spark. Pre-built vLLM wheels from PyPI do not support SM121 — compile from source.
 
-> **Note:** Pre-built vLLM wheels from PyPI do not support SM121. You must compile from source.
-
-**For [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) users:** The hybrid patch is also available as a community mod (`enable-hybrid-int4fp8`). Apply it with `--apply-mod` in the launch script. Note that the `inc.py` patch is tied to a specific vLLM version — if you update the community Docker, the patch may need adjusting (the internal `inc.py` API changes frequently).
+**For [spark-vllm-docker](https://github.com/eugr/spark-vllm-docker) users:** The hybrid INC patch is also available as a community mod (`enable-hybrid-int4fp8`). Apply it with `--apply-mod` in the launch script. Note that the `inc.py` patch is tied to a specific vLLM version — if you update the community Docker, the patch may need adjusting (the internal `inc.py` API changes frequently). PR #38325 cherry-pick is NOT available as a community mod; use Step 3 if you want it.
 
 ---
 
@@ -409,13 +440,49 @@ The MTP weights live in `model_extra_tensors.safetensors` in the Intel AutoRound
 
 **Effect:** 38.4 → 51 tok/s (+33%)
 
-The LM Head (248K × 3072 = 729 MB) is the single largest BF16 bottleneck in the decode step. The v2 shared-weight Triton GEMV kernel:
+The LM Head matrix (vocab 248320 × hidden 3072 ≈ 762M params; **1.5 GB BF16, 729 MB after INT8 quant**) is the single largest weight read in the decode step — it has to be re-read from memory for every token. The v2 shared-weight Triton GEMV kernel:
 
-1. **Quantizes BF16 → INT8 at runtime** (per-channel, no calibration needed)
-2. **Single kernel launch** reads the 729 MB weight matrix ONCE per batch, regardless of batch size (the v1 kernel launched N times for N tokens)
-3. **Triton INT8 GEMV** achieves 84% bandwidth utilization vs 24% for BF16 matmul
+1. **Quantizes BF16 → INT8 at runtime** (per-channel, no calibration needed). One-shot at first request, costs ~5-10s of startup time, saves ~770 MB of bandwidth on every subsequent token.
+2. **Single kernel launch** reads the 729 MB weight matrix ONCE per batch, regardless of batch size (the v1 kernel launched N times for N tokens).
+3. **Triton INT8 GEMV** achieves ~84% memory-bandwidth utilization on a single SM121 LM-head call — vs ~24% for the default BF16 matmul, which is GEMV-shape-unfriendly (M=1) and falls back to a non-tiled CUTLASS path.
 
 No quality degradation: INT8 per-channel quantization of the output layer preserves top-k token rankings.
+
+#### v2.4: `@triton.autotune` (default since 2026-05-09, commit `bd16c23`)
+
+The v2 kernel originally hardcoded `BLOCK_M=128, BLOCK_K=256` with Triton-default `num_warps=4, num_stages=2`. A community contributor on the NVIDIA DGX Spark forum noticed the docstring claimed autotune but the decorator was missing — wrapping the same byte-for-byte-identical kernel in `@triton.autotune` over 8 configs (BLOCK_M ∈ {64,128,256}, BLOCK_K ∈ {128,256,512}, num_warps ∈ {4,8}, num_stages ∈ {2,3}) lets Triton pick the best for each `(M, K, NUM_BATCH)` shape. Measured on Qwen3.5-122B/Spark:
+
+| Test          | Hardcoded | Autotuned | Δ      |
+|---------------|-----------|-----------|--------|
+| Q&A 256       | 50.3      | 50.5      | +0.4%  |
+| Code 512      | 52.0      | 52.6      | +1.1%  |
+| JSON 1024     | 51.0      | 51.3      | +0.5%  |
+| Math 64       | 46.5      | 47.7      | +2.6%  |
+| LongCode 2048 | 54.2      | 54.85     | +1.2%  |
+
+Average **+1.2%** with no quality cost. One-time autotune cost ~6s (1.6s × 4 unique NUM_BATCH ∈ {1..4}) on first request after container start. The contributor measured +8.5% on their vLLM 0.20.1 stack with a 36 tok/s baseline (LM head dominant); the smaller win here reflects our already-optimized stack where LM head is one of several balanced bottlenecks.
+
+### Optimization 5: vLLM PR #38325 swapAB SM120 FP8 GEMM
+
+**Effect:** +0.76% marginal on top of autotune / +2.0% cumulative over the wonderwork v2 baseline. **Default-on since 2026-05-09.** Skip with `--no-pr38325`.
+
+vLLM upstream PR [#38325](https://github.com/vllm-project/vllm/pull/38325) adds a "swapAB" CUTLASS dispatch (B-major weight) for SM120 family blockwise FP8 GEMM. The runtime auto-selects swapAB whenever `M ≤ 64 || M % 4 != 0` — exactly the decode shape our `shared_expert` FP8 layers hit at batch 1-4. SM121 inherits the path via `enable_sm120_family<...>`.
+
+Measured marginal contribution on top of autotune:
+
+| Test          | autotune-only | + PR #38325 | Δ      |
+|---------------|---------------|-------------|--------|
+| Q&A 256       | 50.5          | 50.75       | +0.5%  |
+| Code 512      | 52.6          | 53.4        | +1.5%  |
+| JSON 1024     | 51.3          | 51.6        | +0.6%  |
+| Math 64       | 47.7          | 48.1        | +0.8%  |
+| LongCode 2048 | 54.85         | 55.05       | +0.4%  |
+
+**Why default-on, not opt-in.** The patch costs a full `vllm-sm121` base image rebuild (~30-60 min). On a fresh install that cost is paid anyway — vLLM has no prebuilt SM121 wheels, so Step 3 NVCC-compiles vLLM regardless. Adding PR #38325 to that build is effectively free time-wise. Existing users with cached `vllm-sm121:latest` from before this default flip will skip Step 3 (cached-image check) and miss the +0.76% — they need `--no-cache` to pick it up.
+
+**Why an opt-out exists.** The single .cuh diff is conservative (auto-active on small M only, no other hot paths affected), but if it ever breaks a build for a future eugr/spark-vllm-docker pin or future torch nightly, `--no-pr38325` is the escape hatch. Cost of using it: lose the marginal +0.76%, keep the autotune +1.2%.
+
+The diff lives in `patches/05-pr38325-swapab/pr38325-swapab-fp8-sm120.diff`, rewritten for v0.19.0 source paths (the upstream PR was authored against a later tree where `csrc/libtorch_stable/...` and `torch::stable::Tensor` exist; v0.19.0 still has `csrc/quantization/...` and `torch::Tensor`). When vLLM ≥0.20 becomes our build target, this whole opt-out goes away — PR #38325 was merged into upstream 0.20.x.
 
 ---
 

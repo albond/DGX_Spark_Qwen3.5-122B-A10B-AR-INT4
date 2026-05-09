@@ -69,6 +69,24 @@ def apply():
                 print(f"DGX_SPARK_V2: LM Head -> INT8 Batched Triton ({list(w_int8.shape)}, saved {orig_size//1024//1024}MB)", file=_sys.stderr, flush=True)
                 import triton
                 import triton.language as tl
+                # Backport from community PR (DGX Spark forum): autotune
+                # picks BLOCK_M/BLOCK_K/num_warps/num_stages for SM121 instead
+                # of the hardcoded 128/256/4/2. Arithmetic is byte-identical;
+                # only the kernel-launch parameters change. ~6s once-per-process
+                # autotune cost (per unique NUM_BATCH × 8 configs), then steady
+                # state. Measured on Qwen3.5-122B/Spark: +0.4 to +2.6% across
+                # prompt classes (avg +1.2%), no quality change.
+                _AUTOTUNE_CONFIGS = [
+                    triton.Config({'BLOCK_M': 64,  'BLOCK_K': 256}, num_warps=4, num_stages=3),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_K': 128}, num_warps=4, num_stages=3),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=4, num_stages=2),  # = v2 baseline
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=4, num_stages=3),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_K': 256}, num_warps=8, num_stages=2),
+                    triton.Config({'BLOCK_M': 128, 'BLOCK_K': 512}, num_warps=8, num_stages=2),
+                    triton.Config({'BLOCK_M': 256, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+                    triton.Config({'BLOCK_M': 256, 'BLOCK_K': 256}, num_warps=8, num_stages=2),
+                ]
+                @triton.autotune(configs=_AUTOTUNE_CONFIGS, key=['M', 'K', 'NUM_BATCH'])
                 @triton.jit
                 def _k_v2(out_ptr, w_ptr, x_ptr, s_ptr, M, K,
                           stride_ob, stride_xb, NUM_BATCH: tl.constexpr,
@@ -117,25 +135,22 @@ def apply():
             x = hidden_states.view(-1, K)
             batch = x.shape[0]
             out = torch.empty(batch, M, dtype=torch.float16, device=x.device)
-            BLOCK_M = 128
-            BLOCK_K = 256
-            grid = ((M + BLOCK_M - 1) // BLOCK_M,)
+            # Autotune-aware grid: BLOCK_M is chosen by autotuner per (M,K,NUM_BATCH).
+            grid = lambda meta: ((M + meta['BLOCK_M'] - 1) // meta['BLOCK_M'],)
             if batch <= 4:
                 # Small batch (decode): shared-weight kernel reads weights ONCE
                 nb = batch
                 lm_head._ww_kernel_v2[grid](
                     out, lm_head._ww_int8, x.to(torch.float16),
                     lm_head._ww_scales, M, K,
-                    out.stride(0), x.stride(0), NUM_BATCH=nb,
-                    BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K)
+                    out.stride(0), x.stride(0), NUM_BATCH=nb)
             else:
                 # Large batch (prefill/profile): fall back to per-row loop
                 for b in range(batch):
                     lm_head._ww_kernel_v2[grid](
                         out[b:b+1], lm_head._ww_int8, x[b:b+1].to(torch.float16),
                         lm_head._ww_scales, M, K,
-                        M, K, NUM_BATCH=1,
-                        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K)
+                        M, K, NUM_BATCH=1)
             logits = out.view(hidden_states.shape[:-1] + (M,))
             if embedding_bias is not None:
                 logits = logits + embedding_bias
